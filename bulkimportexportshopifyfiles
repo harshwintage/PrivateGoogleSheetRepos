@@ -680,69 +680,74 @@ function openPushPanel() {
 // Compares Push tab to Data tab and finds differences
 
 function analyzePushChanges() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const pushSheet = ss.getSheetByName('Push');
-  const dataSheet = ss.getSheetByName('Data');
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var pushSheet = ss.getSheetByName('Push');
+  var dataSheet = ss.getSheetByName('Data');
   
   if (!pushSheet) throw new Error('Push tab not found. Copy rows from Data tab into a sheet named "Push".');
   if (!dataSheet) throw new Error('Data tab not found. Run a Pull first.');
   
-  // Read headers and data from both sheets
-  const pushData = pushSheet.getDataRange().getValues();
-  const dataData = dataSheet.getDataRange().getValues();
+  var pushData = pushSheet.getDataRange().getValues();
+  var dataData = dataSheet.getDataRange().getValues();
   
   if (pushData.length < 2) throw new Error('Push tab is empty (no data rows).');
   if (dataData.length < 2) throw new Error('Data tab is empty. Run a Pull first.');
   
-  const pushHeaders = pushData[0].map(h => h.toString().trim());
-  const dataHeaders = dataData[0].map(h => h.toString().trim());
+  var pushHeaders = pushData[0].map(function(h) { return h.toString().trim(); });
+  var dataHeaders = dataData[0].map(function(h) { return h.toString().trim(); });
   
-  // Verify Push tab has Product ID column
-  const pushIdCol = pushHeaders.indexOf('Product ID');
-  if (pushIdCol === -1) throw new Error('Push tab must have a "Product ID" column (copy rows from Data tab).');
+  var pushIdCol = pushHeaders.indexOf('Product ID');
+  if (pushIdCol === -1) throw new Error('Push tab must have a "Product ID" column.');
   
-  const dataIdCol = dataHeaders.indexOf('Product ID');
-  if (dataIdCol === -1) throw new Error('Data tab is missing "Product ID" column. Re-pull.');
+  var dataIdCol = dataHeaders.indexOf('Product ID');
+  if (dataIdCol === -1) throw new Error('Data tab is missing "Product ID" column.');
   
-  // Build a lookup of Data tab by Product ID
-  const dataLookup = {};
-  for (let i = 1; i < dataData.length; i++) {
-    const id = dataData[i][dataIdCol].toString().trim();
+  // Build lookup of Data tab by Product ID
+  var dataLookup = {};
+  for (var i = 1; i < dataData.length; i++) {
+    var id = dataData[i][dataIdCol].toString().trim();
     if (id) {
-      const rowObj = {};
-      dataHeaders.forEach((h, col) => { rowObj[h] = dataData[i][col]; });
+      var rowObj = {};
+      dataHeaders.forEach(function(h, col) { rowObj[h] = dataData[i][col]; });
       dataLookup[id] = rowObj;
     }
   }
   
-  // Find pushable columns — these are fields the API can update
-  const pushableFields = ['Title', 'Tags', 'Category ID', 'Vendor', 'Product Type', 'Status', 'SEO Title', 'SEO Description', 'Description (HTML)'];
+  // Pushable fields — standard ones
+  var pushableFields = ['Title', 'Tags', 'Category ID', 'Vendor', 'Product Type', 
+    'Status', 'SEO Title', 'SEO Description', 'Description (HTML)'];
+  
   // Also any MF: columns
-  const mfColumns = pushHeaders.filter(h => h.startsWith('MF: '));
-  const allPushable = [...pushableFields, ...mfColumns];
+  var mfColumns = pushHeaders.filter(function(h) { return h.indexOf('MF: ') === 0; });
   
-  // Read-only columns — pulled but can't be pushed back
-  const readOnlyFields = ['Product ID', 'Handle', 'SKU', 'Category Name', 'Category Full Name', 'Image 1', 'Image 2', 'Image 3', 'Variant Count', 'Variants (JSON)'];
+  // Also any CAT: columns (NEW in Phase 3)
+  var catColumns = pushHeaders.filter(function(h) { return h.indexOf('CAT: ') === 0; });
   
-  // Compare each row in Push tab to Data tab
-  const changes = [];
+  var allPushable = pushableFields.concat(mfColumns).concat(catColumns);
   
-  for (let i = 1; i < pushData.length; i++) {
-    const productId = pushData[i][pushIdCol].toString().trim();
+  // Read-only columns
+  var readOnlyFields = ['Product ID', 'Handle', 'SKU', 'Category Name', 'Category Full Name', 
+    'Image 1', 'Image 2', 'Image 3', 'Variant Count', 'Variants (JSON)'];
+  
+  // Compare each row
+  var changes = [];
+  
+  for (var i = 1; i < pushData.length; i++) {
+    var productId = pushData[i][pushIdCol].toString().trim();
     if (!productId) continue;
     
-    const handle = pushData[i][pushHeaders.indexOf('Handle')] || '';
-    const title = pushData[i][pushHeaders.indexOf('Title')] || '';
-    const dataRow = dataLookup[productId];
+    var handle = pushData[i][pushHeaders.indexOf('Handle')] || '';
+    var title = pushData[i][pushHeaders.indexOf('Title')] || '';
+    var dataRow = dataLookup[productId];
     
-    const rowChanges = [];
+    var rowChanges = [];
     
-    allPushable.forEach(field => {
-      const pushCol = pushHeaders.indexOf(field);
-      if (pushCol === -1) return; // Field not in Push tab
+    allPushable.forEach(function(field) {
+      var pushCol = pushHeaders.indexOf(field);
+      if (pushCol === -1) return;
       
-      const pushVal = pushData[i][pushCol]?.toString().trim() || '';
-      const dataVal = dataRow ? (dataRow[field]?.toString().trim() || '') : '';
+      var pushVal = pushData[i][pushCol] != null ? pushData[i][pushCol].toString().trim() : '';
+      var dataVal = dataRow ? (dataRow[field] != null ? dataRow[field].toString().trim() : '') : '';
       
       if (pushVal !== dataVal) {
         rowChanges.push({
@@ -764,20 +769,23 @@ function analyzePushChanges() {
     }
   }
   
-  // Get pull timestamp from Data tab
-  const pullTimestamp = dataSheet.getRange(1, dataHeaders.length + 3).getValue();
+  // Get pull timestamp
+  var pullTimestamp = dataSheet.getRange(1, dataHeaders.length + 3).getValue();
   
   return {
     totalPushRows: pushData.length - 1,
     productsWithChanges: changes.length,
-    totalChanges: changes.reduce((sum, c) => sum + c.changes.length, 0),
+    totalChanges: changes.reduce(function(sum, c) { return sum + c.changes.length; }, 0),
     pullTimestamp: pullTimestamp ? pullTimestamp.toString() : 'Unknown',
     changes: changes,
-    pushableColumns: allPushable.filter(f => pushHeaders.includes(f)),
-    readOnlyColumns: readOnlyFields.filter(f => pushHeaders.includes(f)),
-    ignoredEdits: [] // populated below
+    pushableColumns: allPushable.filter(function(f) { return pushHeaders.indexOf(f) !== -1; }),
+    readOnlyColumns: readOnlyFields.filter(function(f) { return pushHeaders.indexOf(f) !== -1; }),
+    ignoredEdits: []
   };
 }
+ 
+ 
+// ============================================================
 
 // ── EXECUTE PUSH (CHUNKED) ──────────────────────────────────
 // Processes in batches of 200 to stay within Apps Script's 6-min limit.
@@ -972,20 +980,24 @@ function cancelPush() {
 
 // ── BUILD UPDATE MUTATION ───────────────────────────────────
 
-function buildUpdateMutation_(product) {
-  const productInput = {
+  function buildUpdateMutation_(product) {
+  // Load taxonomy reference (cached per push batch would be better,
+  // but this is simple and works — the sheet read is fast)
+  var taxRef = loadTaxonomyReference_();
+  
+  var productInput = {
     id: product.productId
   };
   
-  const metafields = [];
+  var metafields = [];
   
-  product.changes.forEach(change => {
+  product.changes.forEach(function(change) {
+    // ── Standard fields ──
     if (change.field === 'Title') {
       productInput.title = change.newValue;
     }
     else if (change.field === 'Tags') {
-      // Tags are comma-separated in the sheet, need to be an array
-      productInput.tags = change.newValue.split(',').map(t => t.trim()).filter(t => t);
+      productInput.tags = change.newValue.split(',').map(function(t) { return t.trim(); }).filter(function(t) { return t; });
     }
     else if (change.field === 'Category ID') {
       productInput.category = change.newValue;
@@ -1010,18 +1022,34 @@ function buildUpdateMutation_(product) {
       if (!productInput.seo) productInput.seo = {};
       productInput.seo.description = change.newValue;
     }
-    else if (change.field.startsWith('MF: ')) {
-      // Metafield: "MF: namespace.key"
-      const fullKey = change.field.replace('MF: ', '');
-      const dotIndex = fullKey.indexOf('.');
-      const namespace = fullKey.substring(0, dotIndex);
-      const key = fullKey.substring(dotIndex + 1);
+    // ── CAT: columns (category metafields) — NEW ──
+    else if (change.field.indexOf('CAT: ') === 0) {
+      var catInfo = catColumnToMetafieldKey_(change.field, taxRef);
+      
+      if (catInfo) {
+        // Convert display names to GID JSON array
+        var gidJson = displayNamesToGidJson_(change.newValue, catInfo.moType, taxRef);
+        
+        metafields.push({
+          namespace: catInfo.namespace,
+          key: catInfo.key,
+          value: gidJson,
+          type: 'list.metaobject_reference'
+        });
+      }
+    }
+    // ── MF: columns (regular metafields) ──
+    else if (change.field.indexOf('MF: ') === 0) {
+      var fullKey = change.field.replace('MF: ', '');
+      var dotIndex = fullKey.indexOf('.');
+      var namespace = fullKey.substring(0, dotIndex);
+      var key = fullKey.substring(dotIndex + 1);
       
       metafields.push({
         namespace: namespace,
         key: key,
         value: change.newValue,
-        type: 'single_line_text_field' // Default — will be overridden for existing metafields
+        type: 'single_line_text_field'
       });
     }
   });
@@ -1030,23 +1058,23 @@ function buildUpdateMutation_(product) {
     productInput.metafields = metafields;
   }
   
-  const query = `
-    mutation UpdateProduct($product: ProductInput!) {
-      productUpdate(input: $product) {
-        product {
-          id
-          title
-          tags
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
+  var query = '\
+    mutation UpdateProduct($product: ProductInput!) {\
+      productUpdate(input: $product) {\
+        product {\
+          id\
+          title\
+          tags\
+        }\
+        userErrors {\
+          field\
+          message\
+        }\
+      }\
+    }\
+  ';
   
-  return { query, variables: { product: productInput } };
+  return { query: query, variables: { product: productInput } };
 }
 
 // ── WRITE PUSH RESULTS ──────────────────────────────────────
@@ -2318,6 +2346,88 @@ function categoryMetafieldColumnName_(namespaceKey, taxRef) {
   // Fallback: title-case the key
   var friendly = key.replace(/-/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
   return 'CAT: ' + friendly;
+}
+ 
+ 
+// ============================================================
+function catColumnToMetafieldKey_(columnName, taxRef) {
+  if (!columnName || columnName.indexOf('CAT: ') !== 0) return null;
+  
+  var attrName = columnName.replace('CAT: ', '');
+  
+  if (!taxRef) return null;
+  
+  // Search metaobjectTypeToAttributeName for a match
+  var types = Object.keys(taxRef.metaobjectTypeToAttributeName);
+  for (var i = 0; i < types.length; i++) {
+    if (taxRef.metaobjectTypeToAttributeName[types[i]] === attrName) {
+      // Found it. Type is like "shopify--neckline"
+      // Convert to namespace.key: "shopify.neckline"
+      var moType = types[i]; // "shopify--neckline"
+      var parts = moType.split('--');
+      if (parts.length === 2) {
+        return { namespace: parts[0], key: parts[1], moType: moType };
+      }
+    }
+  }
+  
+  // Fallback: guess from the column name
+  // "CAT: Neckline" → "shopify.neckline"
+  var guessedKey = attrName.toLowerCase().replace(/ /g, '-');
+  return { namespace: 'shopify', key: guessedKey, moType: 'shopify--' + guessedKey };
+}
+ 
+ 
+// ── CONVERT DISPLAY NAMES TO GID JSON ARRAY ─────────────────
+// Takes "V-neck, Round" and converts to:
+//   ["gid://shopify/Metaobject/123", "gid://shopify/Metaobject/456"]
+// Uses the Taxonomy Reference for the lookup.
+// Returns the JSON string that Shopify expects.
+ 
+function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
+  if (!displayNamesCsv || !displayNamesCsv.toString().trim()) return '[]';
+  if (!taxRef) return '[]';
+  
+  var names = displayNamesCsv.toString().split(',').map(function(n) { return n.trim(); }).filter(function(n) { return n; });
+  var gids = [];
+  var errors = [];
+  
+  var lookupTable = taxRef.displayNameToGid[moType] || {};
+  
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var gid = lookupTable[name];
+    
+    if (gid) {
+      gids.push(gid);
+    } else {
+      // Try case-insensitive match
+      var found = false;
+      var keys = Object.keys(lookupTable);
+      for (var j = 0; j < keys.length; j++) {
+        if (keys[j].toLowerCase() === name.toLowerCase()) {
+          gids.push(lookupTable[keys[j]]);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        // Check if it's already a GID (user pasted raw GID)
+        if (name.indexOf('gid://shopify/Metaobject/') === 0) {
+          gids.push(name);
+        } else {
+          errors.push(name);
+        }
+      }
+    }
+  }
+  
+  if (errors.length > 0) {
+    throw new Error('Unknown values for ' + moType + ': ' + errors.join(', ') + 
+      '. Check the Taxonomy Reference sheet for valid values.');
+  }
+  
+  return JSON.stringify(gids);
 }
  
  
