@@ -1,0 +1,2089 @@
+// ============================================================
+// INDOPHILIA — SHOPIFY PRODUCT PULL ENGINE v2
+// Google Apps Script — Paste into Apps Script Editorrrr
+// ============================================================
+// SETUP:
+// 1. Paste this code into Apps Script
+// 2. Go to Project Settings (gear icon) → Script Properties → Add:
+//    CLIENT_ID     → your client ID
+//    CLIENT_SECRET → your client secret
+//    SHOP_DOMAIN   → indophiliausa.myshopify.com
+// 3. Reload the sheet — you'll see a 🛍️ Shopify menu
+// 4. Click 🛍️ Shopify → Test Connection
+// 5. Click 🛍️ Shopify → Open Pull Panel
+// ============================================================
+
+// ── CONFIGURATION ───────────────────────────────────────────
+
+function getConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    clientId: props.getProperty('CLIENT_ID'),
+    clientSecret: props.getProperty('CLIENT_SECRET'),
+    shopDomain: props.getProperty('SHOP_DOMAIN') || 'indophiliausa.myshopify.com'
+  };
+}
+
+// ── AUTHENTICATION ──────────────────────────────────────────
+
+function getAccessToken_() {
+  const config = getConfig_();
+  const url = `https://${config.shopDomain}/admin/oauth/access_token`;
+  
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: {
+      grant_type: 'client_credentials',
+      client_id: config.clientId,
+      client_secret: config.clientSecret
+    },
+    muteHttpExceptions: true
+  });
+  
+  const code = response.getResponseCode();
+  const body = JSON.parse(response.getContentText());
+  
+  if (code !== 200) {
+    throw new Error(`Auth failed (${code}): ${JSON.stringify(body)}`);
+  }
+  
+  return body.access_token;
+}
+
+// ── GRAPHQL HELPER ──────────────────────────────────────────
+
+function shopifyGraphQL_(token, shopDomain, query, variables) {
+  const url = `https://${shopDomain}/admin/api/2025-01/graphql.json`;
+  
+  const payload = { query: query };
+  if (variables) payload.variables = variables;
+  
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Shopify-Access-Token': token },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  
+  const code = response.getResponseCode();
+  const body = JSON.parse(response.getContentText());
+  
+  if (code !== 200) throw new Error(`GraphQL error (${code}): ${JSON.stringify(body)}`);
+  if (body.errors) throw new Error(`GraphQL errors: ${JSON.stringify(body.errors)}`);
+  
+  // Rate limit handling
+  const cost = body.extensions?.cost;
+  if (cost && cost.throttleStatus.currentlyAvailable < 100) {
+    Utilities.sleep(2000);
+  }
+  
+  return body;
+}
+
+// ── CUSTOM MENU ─────────────────────────────────────────────
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🛍️ Shopify')
+    .addItem('🔗 Test Connection', 'testConnection')
+    .addSeparator()
+    .addItem('📥 Open Pull Panel', 'openPullPanel')
+    .addItem('📥 Quick Pull — All Products', 'pullAll')
+    .addItem('📥 Quick Pull — Metafields Only', 'pullMetafieldsOnly')
+    .addSeparator()
+    .addItem('📤 Open Push Panel', 'openPushPanel')
+    .addItem('📤 Quick Push — Dry Run', 'dryRunPush')
+    .addSeparator()
+    .addItem('🔍 List Metafield Definitions', 'listMetafieldDefinitions')
+    .addItem('🏷️ Build Taxonomy Reference', 'buildTaxonomyReference')
+    .addToUi();
+}
+
+// ── TEST CONNECTION ─────────────────────────────────────────
+
+function testConnection() {
+  try {
+    const token = getAccessToken_();
+    const config = getConfig_();
+    const query = `{ shop { name } products(first: 1) { edges { node { id } } } }`;
+    const result = shopifyGraphQL_(token, config.shopDomain, query);
+    SpreadsheetApp.getUi().alert(`✅ Connected to: ${result.data.shop.name}\nAuth is working — ready to pull.`);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('❌ Connection failed:\n\n' + e.message);
+  }
+}
+
+// ── OPEN SIDEBAR ────────────────────────────────────────────
+
+function openPullPanel() {
+  const html = HtmlService.createHtmlOutput(getSidebarHtml_())
+    .setTitle('Shopify Pull Panel')
+    .setWidth(400);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+// ── FETCH STORE METADATA (called from sidebar) ─────────────
+// Gets all unique product types, tags, vendors, statuses, and metafield keys
+
+function fetchStoreMetadata() {
+  const token = getAccessToken_();
+  const config = getConfig_();
+  
+  // We'll scan products to build frequency maps
+  const productTypes = {};
+  const tags = {};
+  const vendors = {};
+  const statuses = { 'ACTIVE': 0, 'DRAFT': 0, 'ARCHIVED': 0 };
+  const metafieldKeys = {};
+  
+  let cursor = null;
+  let hasNextPage = true;
+  let totalProducts = 0;
+  
+  while (hasNextPage) {
+    const afterClause = cursor ? `, after: "${cursor}"` : '';
+    const query = `{
+      products(first: 100${afterClause}) {
+        edges {
+          node {
+            productType
+            tags
+            vendor
+            status
+            metafields(first: 50) {
+              edges {
+                node {
+                  namespace
+                  key
+                }
+              }
+            }
+          }
+          cursor
+        }
+        pageInfo { hasNextPage }
+      }
+    }`;
+    
+    const result = shopifyGraphQL_(token, config.shopDomain, query);
+    const edges = result.data.products.edges;
+    hasNextPage = result.data.products.pageInfo.hasNextPage;
+    
+    if (edges.length > 0) {
+      cursor = edges[edges.length - 1].cursor;
+    } else {
+      hasNextPage = false;
+    }
+    
+    edges.forEach(edge => {
+      const p = edge.node;
+      totalProducts++;
+      
+      // Product type frequency
+      if (p.productType) {
+        productTypes[p.productType] = (productTypes[p.productType] || 0) + 1;
+      }
+      
+      // Tags frequency
+      if (p.tags) {
+        p.tags.forEach(tag => {
+          tags[tag] = (tags[tag] || 0) + 1;
+        });
+      }
+      
+      // Vendor frequency
+      if (p.vendor) {
+        vendors[p.vendor] = (vendors[p.vendor] || 0) + 1;
+      }
+      
+      // Status count
+      if (p.status) {
+        statuses[p.status] = (statuses[p.status] || 0) + 1;
+      }
+      
+      // Metafield keys
+      if (p.metafields?.edges) {
+        p.metafields.edges.forEach(mf => {
+          const key = `${mf.node.namespace}.${mf.node.key}`;
+          metafieldKeys[key] = (metafieldKeys[key] || 0) + 1;
+        });
+      }
+    });
+    
+    Utilities.sleep(300);
+  }
+  
+  // Sort by frequency (most common first)
+  const sortByFreq = (obj) => Object.entries(obj)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => ({ name, count }));
+  
+  return {
+    totalProducts,
+    productTypes: sortByFreq(productTypes),
+    tags: sortByFreq(tags),
+    vendors: sortByFreq(vendors),
+    statuses: sortByFreq(statuses),
+    metafieldKeys: sortByFreq(metafieldKeys)
+  };
+}
+
+// ── FETCH SAMPLE PRODUCT (called from sidebar) ──────────────
+
+function fetchSampleProduct(productType) {
+  const token = getAccessToken_();
+  const config = getConfig_();
+  
+  const queryFilter = productType ? `, query: "product_type:'${productType}'"` : '';
+  
+  const query = `{
+    products(first: 1${queryFilter}) {
+      edges {
+        node {
+          handle
+          title
+          productType
+          status
+          tags
+          vendor
+          category { fullName }
+          images(first: 3) { edges { node { url } } }
+          metafields(first: 20) {
+            edges {
+              node {
+                namespace
+                key
+                value
+                type
+              }
+            }
+          }
+        }
+      }
+    }
+  }`;
+  
+  const result = shopifyGraphQL_(token, config.shopDomain, query);
+  const product = result.data.products.edges[0]?.node;
+  
+  if (!product) return null;
+  
+  return {
+    handle: product.handle,
+    title: product.title,
+    productType: product.productType,
+    status: product.status,
+    tags: product.tags?.join(', '),
+    vendor: product.vendor,
+    category: product.category?.fullName || '(none)',
+    images: product.images?.edges?.map(e => e.node.url) || [],
+    metafields: product.metafields?.edges?.map(e => ({
+      key: `${e.node.namespace}.${e.node.key}`,
+      value: e.node.value,
+      type: e.node.type
+    })) || []
+  };
+}
+
+// ── EXECUTE PULL (called from sidebar) ──────────────────────
+
+function executePull(options) {
+  // options = { filters: { productTypes: [], tags: [], vendors: [], statuses: [] },
+  //             fields: { title: true, handle: true, ... },
+  //             metafieldKeys: [] }
+  
+  const token = getAccessToken_();
+  const config = getConfig_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Build GraphQL query filter string
+  const queryParts = [];
+  
+  if (options.filters.statuses && options.filters.statuses.length > 0) {
+    if (options.filters.statuses.length === 1) {
+      queryParts.push(`status:${options.filters.statuses[0]}`);
+    } else {
+      const statusOr = options.filters.statuses.map(s => `status:${s}`).join(' OR ');
+      queryParts.push(`(${statusOr})`);
+    }
+  }
+  
+  if (options.filters.productTypes && options.filters.productTypes.length > 0) {
+    if (options.filters.productTypes.length === 1) {
+      queryParts.push(`product_type:'${options.filters.productTypes[0]}'`);
+    } else {
+      const ptOr = options.filters.productTypes.map(pt => `product_type:'${pt}'`).join(' OR ');
+      queryParts.push(`(${ptOr})`);
+    }
+  }
+  
+  if (options.filters.vendors && options.filters.vendors.length > 0) {
+    if (options.filters.vendors.length === 1) {
+      queryParts.push(`vendor:'${options.filters.vendors[0]}'`);
+    } else {
+      const vOr = options.filters.vendors.map(v => `vendor:'${v}'`).join(' OR ');
+      queryParts.push(`(${vOr})`);
+    }
+  }
+  
+  if (options.filters.tags && options.filters.tags.length > 0) {
+    options.filters.tags.forEach(tag => {
+      queryParts.push(`tag:'${tag}'`);
+    });
+  }
+  
+  const queryFilter = queryParts.join(' AND ');
+  
+  // Build GraphQL product fields
+  let productFields = '\n    id\n    handle';
+  const f = options.fields;
+  
+  if (f.title) productFields += '\n    title';
+  if (f.productType) productFields += '\n    productType';
+  if (f.status) productFields += '\n    status';
+  if (f.tags) productFields += '\n    tags';
+  if (f.vendor) productFields += '\n    vendor';
+  if (f.category) productFields += '\n    category { id name fullName }';
+  if (f.descriptionHtml) productFields += '\n    descriptionHtml';
+  if (f.seo) productFields += '\n    seo { title description }';
+  if (f.images) productFields += '\n    images(first: 10) { edges { node { url altText } } }';
+  // Variants / SKU — handle both fields needing variant data
+  const needsVariants = f.sku || f.variants;
+  if (needsVariants) {
+    if (f.variants) {
+      productFields += '\n    variants(first: 100) { edges { node { id title sku price inventoryQuantity } } }';
+    } else {
+      // Only need SKU
+      productFields += '\n    variants(first: 100) { edges { node { sku } } }';
+    }
+  }
+  if (f.metafields) productFields += '\n    metafields(first: 50) { edges { node { namespace key value type } } }';
+  
+  // Paginate through products
+  let allProducts = [];
+  let cursor = null;
+  let hasNextPage = true;
+  
+  while (hasNextPage) {
+    const afterClause = cursor ? `, after: "${cursor}"` : '';
+    const filterClause = queryFilter ? `, query: "${queryFilter.replace(/"/g, '\\"')}"` : '';
+    
+    const query = `{
+      products(first: 50${afterClause}${filterClause}, sortKey: TITLE) {
+        edges {
+          node { ${productFields} }
+          cursor
+        }
+        pageInfo { hasNextPage }
+      }
+    }`;
+    
+    const result = shopifyGraphQL_(token, config.shopDomain, query);
+    const edges = result.data.products.edges;
+    hasNextPage = result.data.products.pageInfo.hasNextPage;
+    
+    if (edges.length > 0) {
+      cursor = edges[edges.length - 1].cursor;
+      edges.forEach(edge => allProducts.push(edge.node));
+    } else {
+      hasNextPage = false;
+    }
+    
+    Utilities.sleep(500);
+  }
+  
+  // Filter metafields by selected keys
+  if (f.metafields && options.metafieldKeys && options.metafieldKeys.length > 0) {
+    allProducts = allProducts.map(product => {
+      if (product.metafields?.edges) {
+        product.metafields.edges = product.metafields.edges.filter(edge => {
+          const key = `${edge.node.namespace}.${edge.node.key}`;
+          return options.metafieldKeys.includes(key);
+        });
+      }
+      return product;
+    });
+  }
+  
+  // Write to Data sheet
+  writeToDataSheet_(ss, allProducts, f, options.metafieldKeys);
+  
+  // Log
+  logAction_(ss, 'PULL', `${allProducts.length} products. Filter: ${queryFilter || 'none'}`, '✅ Success');
+  
+  return { count: allProducts.length };
+}
+
+// ── WRITE DATA TO SHEET ─────────────────────────────────────
+
+function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
+  let dataSheet = ss.getSheetByName('Data');
+  if (!dataSheet) dataSheet = ss.insertSheet('Data');
+  
+  // Remove existing protection so we can write
+  dataSheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => {
+    if (p.canEdit()) p.remove();
+  });
+  
+  dataSheet.clear();
+  
+  if (products.length === 0) {
+    dataSheet.getRange('A1').setValue('No products found matching your filters');
+    return;
+  }
+  
+  // Build headers
+  const headers = ['Product ID', 'Handle'];
+  if (fields.sku) headers.push('SKU');
+  if (fields.title) headers.push('Title');
+  if (fields.productType) headers.push('Product Type');
+  if (fields.status) headers.push('Status');
+  if (fields.tags) headers.push('Tags');
+  if (fields.category) headers.push('Category ID', 'Category Name', 'Category Full Name');
+  if (fields.vendor) headers.push('Vendor');
+  if (fields.descriptionHtml) headers.push('Description (HTML)');
+  if (fields.seo) headers.push('SEO Title', 'SEO Description');
+  if (fields.images) headers.push('Image 1', 'Image 2', 'Image 3');
+  
+  // Metafield columns
+  let metafieldKeys = [];
+  if (fields.metafields) {
+    if (selectedMetafieldKeys && selectedMetafieldKeys.length > 0) {
+      metafieldKeys = selectedMetafieldKeys;
+    } else {
+      // Discover all keys from data
+      const keySet = new Set();
+      products.forEach(p => {
+        if (p.metafields?.edges) {
+          p.metafields.edges.forEach(e => keySet.add(`${e.node.namespace}.${e.node.key}`));
+        }
+      });
+      metafieldKeys = Array.from(keySet).sort();
+    }
+    metafieldKeys.forEach(key => headers.push(`MF: ${key}`));
+  }
+  
+  if (fields.variants) headers.push('Variant Count', 'Variants (JSON)');
+  
+  // Build rows
+  const rows = products.map(product => {
+    const row = [product.id, product.handle];
+    
+    if (fields.sku) {
+      const skus = product.variants?.edges?.map(v => v.node.sku).filter(s => s) || [];
+      row.push(skus.join(', '));
+    }
+    if (fields.title) row.push(product.title || '');
+    if (fields.productType) row.push(product.productType || '');
+    if (fields.status) row.push(product.status || '');
+    if (fields.tags) row.push((product.tags || []).join(', '));
+    if (fields.category) {
+      row.push(product.category?.id || '', product.category?.name || '', product.category?.fullName || '');
+    }
+    if (fields.vendor) row.push(product.vendor || '');
+    if (fields.descriptionHtml) row.push(product.descriptionHtml || '');
+    if (fields.seo) {
+      row.push(product.seo?.title || '', product.seo?.description || '');
+    }
+    if (fields.images) {
+      const imgs = product.images?.edges || [];
+      row.push(imgs[0]?.node?.url || '', imgs[1]?.node?.url || '', imgs[2]?.node?.url || '');
+    }
+    if (fields.metafields) {
+      const mfMap = {};
+      if (product.metafields?.edges) {
+        product.metafields.edges.forEach(e => {
+          mfMap[`${e.node.namespace}.${e.node.key}`] = e.node.value;
+        });
+      }
+      metafieldKeys.forEach(key => row.push(mfMap[key] || ''));
+    }
+    if (fields.variants) {
+      const vars = product.variants?.edges || [];
+      row.push(vars.length, JSON.stringify(vars.map(v => v.node)));
+    }
+    
+    return row;
+  });
+  
+  // Write
+  dataSheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e8e8e8');
+  if (rows.length > 0) {
+    dataSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+  
+  // Add pull timestamp
+  dataSheet.getRange(1, headers.length + 2).setValue('Pulled at:').setFontWeight('bold');
+  dataSheet.getRange(1, headers.length + 3).setValue(new Date());
+  
+  // Auto-resize columns (first 10)
+  for (let i = 1; i <= Math.min(headers.length, 10); i++) {
+    dataSheet.autoResizeColumn(i);
+  }
+  dataSheet.setFrozenRows(1);
+  
+  // PROTECT the sheet — read only for everyone except owner
+  const protection = dataSheet.protect().setDescription('Auto-locked after pull. Do not edit — use Push tab.');
+  // Remove all editors except the owner
+  const me = Session.getEffectiveUser();
+  protection.addEditor(me);
+  try {
+    protection.removeEditors(protection.getEditors());
+    protection.addEditor(me);
+  } catch (e) {
+    // If we can't manage editors, at least set a warning
+    protection.setWarningOnly(true);
+  }
+}
+
+// ── LOGGING ─────────────────────────────────────────────────
+
+function logAction_(ss, action, details, status) {
+  let logsSheet = ss.getSheetByName('Logs');
+  if (!logsSheet) {
+    logsSheet = ss.insertSheet('Logs');
+    logsSheet.getRange('A1:D1').setValues([['Timestamp', 'Action', 'Details', 'Status']]).setFontWeight('bold');
+  }
+  const nextRow = logsSheet.getLastRow() + 1;
+  logsSheet.getRange(nextRow, 1, 1, 4).setValues([[new Date(), action, details, status]]);
+}
+
+// ── PRESET FUNCTIONS ────────────────────────────────────────
+
+function pullAll() {
+  const result = executePull({
+    filters: { statuses: ['ACTIVE'], productTypes: [], tags: [], vendors: [] },
+    fields: { sku: true, title: true, productType: true, status: true, tags: true, vendor: true, category: true, images: true, metafields: true, variants: false, descriptionHtml: false, seo: false },
+    metafieldKeys: []
+  });
+  SpreadsheetApp.getUi().alert(`✅ Pulled ${result.count} active products.`);
+}
+
+function pullMetafieldsOnly() {
+  const result = executePull({
+    filters: { statuses: ['ACTIVE'], productTypes: [], tags: [], vendors: [] },
+    fields: { sku: true, title: true, productType: false, status: false, tags: false, vendor: false, category: false, images: false, metafields: true, variants: false, descriptionHtml: false, seo: false },
+    metafieldKeys: []
+  });
+  SpreadsheetApp.getUi().alert(`✅ Pulled ${result.count} products (metafields only).`);
+}
+
+// ── LIST METAFIELD DEFINITIONS ──────────────────────────────
+
+function listMetafieldDefinitions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    const token = getAccessToken_();
+    const config = getConfig_();
+    
+    const query = `{
+      metafieldDefinitions(first: 100, ownerType: PRODUCT) {
+        edges {
+          node { id name namespace key type { name } pinnedPosition }
+        }
+      }
+    }`;
+    
+    const result = shopifyGraphQL_(token, config.shopDomain, query);
+    const defs = result.data.metafieldDefinitions.edges.map(e => e.node);
+    
+    let defSheet = ss.getSheetByName('Metafield Definitions');
+    if (!defSheet) defSheet = ss.insertSheet('Metafield Definitions');
+    defSheet.clear();
+    
+    const headers = ['Definition ID', 'Name', 'Namespace', 'Key', 'Type', 'Pinned'];
+    defSheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    
+    if (defs.length > 0) {
+      const rows = defs.map(d => [d.id, d.name, d.namespace, d.key, d.type.name, d.pinnedPosition || '']);
+      defSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+    }
+    
+    SpreadsheetApp.getUi().alert(`✅ Found ${defs.length} metafield definitions.`);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('❌ Failed:\n\n' + e.message);
+  }
+}
+
+// ── OPEN PUSH PANEL ─────────────────────────────────────────
+
+function openPushPanel() {
+  const html = HtmlService.createHtmlOutput(getPushSidebarHtml_())
+    .setTitle('Shopify Push Panel')
+    .setWidth(420);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+// ── ANALYZE PUSH TAB (called from push sidebar) ─────────────
+// Compares Push tab to Data tab and finds differences
+
+function analyzePushChanges() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const pushSheet = ss.getSheetByName('Push');
+  const dataSheet = ss.getSheetByName('Data');
+  
+  if (!pushSheet) throw new Error('Push tab not found. Copy rows from Data tab into a sheet named "Push".');
+  if (!dataSheet) throw new Error('Data tab not found. Run a Pull first.');
+  
+  // Read headers and data from both sheets
+  const pushData = pushSheet.getDataRange().getValues();
+  const dataData = dataSheet.getDataRange().getValues();
+  
+  if (pushData.length < 2) throw new Error('Push tab is empty (no data rows).');
+  if (dataData.length < 2) throw new Error('Data tab is empty. Run a Pull first.');
+  
+  const pushHeaders = pushData[0].map(h => h.toString().trim());
+  const dataHeaders = dataData[0].map(h => h.toString().trim());
+  
+  // Verify Push tab has Product ID column
+  const pushIdCol = pushHeaders.indexOf('Product ID');
+  if (pushIdCol === -1) throw new Error('Push tab must have a "Product ID" column (copy rows from Data tab).');
+  
+  const dataIdCol = dataHeaders.indexOf('Product ID');
+  if (dataIdCol === -1) throw new Error('Data tab is missing "Product ID" column. Re-pull.');
+  
+  // Build a lookup of Data tab by Product ID
+  const dataLookup = {};
+  for (let i = 1; i < dataData.length; i++) {
+    const id = dataData[i][dataIdCol].toString().trim();
+    if (id) {
+      const rowObj = {};
+      dataHeaders.forEach((h, col) => { rowObj[h] = dataData[i][col]; });
+      dataLookup[id] = rowObj;
+    }
+  }
+  
+  // Find pushable columns — these are fields the API can update
+  const pushableFields = ['Title', 'Tags', 'Category ID', 'Vendor', 'Product Type', 'Status', 'SEO Title', 'SEO Description', 'Description (HTML)'];
+  // Also any MF: columns
+  const mfColumns = pushHeaders.filter(h => h.startsWith('MF: '));
+  const allPushable = [...pushableFields, ...mfColumns];
+  
+  // Read-only columns — pulled but can't be pushed back
+  const readOnlyFields = ['Product ID', 'Handle', 'SKU', 'Category Name', 'Category Full Name', 'Image 1', 'Image 2', 'Image 3', 'Variant Count', 'Variants (JSON)'];
+  
+  // Compare each row in Push tab to Data tab
+  const changes = [];
+  
+  for (let i = 1; i < pushData.length; i++) {
+    const productId = pushData[i][pushIdCol].toString().trim();
+    if (!productId) continue;
+    
+    const handle = pushData[i][pushHeaders.indexOf('Handle')] || '';
+    const title = pushData[i][pushHeaders.indexOf('Title')] || '';
+    const dataRow = dataLookup[productId];
+    
+    const rowChanges = [];
+    
+    allPushable.forEach(field => {
+      const pushCol = pushHeaders.indexOf(field);
+      if (pushCol === -1) return; // Field not in Push tab
+      
+      const pushVal = pushData[i][pushCol]?.toString().trim() || '';
+      const dataVal = dataRow ? (dataRow[field]?.toString().trim() || '') : '';
+      
+      if (pushVal !== dataVal) {
+        rowChanges.push({
+          field: field,
+          oldValue: dataVal,
+          newValue: pushVal
+        });
+      }
+    });
+    
+    if (rowChanges.length > 0) {
+      changes.push({
+        productId: productId,
+        handle: handle.toString(),
+        title: title.toString(),
+        rowNum: i + 1,
+        changes: rowChanges
+      });
+    }
+  }
+  
+  // Get pull timestamp from Data tab
+  const pullTimestamp = dataSheet.getRange(1, dataHeaders.length + 3).getValue();
+  
+  return {
+    totalPushRows: pushData.length - 1,
+    productsWithChanges: changes.length,
+    totalChanges: changes.reduce((sum, c) => sum + c.changes.length, 0),
+    pullTimestamp: pullTimestamp ? pullTimestamp.toString() : 'Unknown',
+    changes: changes,
+    pushableColumns: allPushable.filter(f => pushHeaders.includes(f)),
+    readOnlyColumns: readOnlyFields.filter(f => pushHeaders.includes(f)),
+    ignoredEdits: [] // populated below
+  };
+}
+
+// ── EXECUTE PUSH (CHUNKED) ──────────────────────────────────
+// Processes in batches of 200 to stay within Apps Script's 6-min limit.
+// Uses ScriptProperties to track progress across runs.
+// Auto-chains via time-based triggers if more batches remain.
+
+var PUSH_BATCH_SIZE = 200;
+
+function executePush(isDryRun) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const analysis = analyzePushChanges();
+  
+  if (analysis.productsWithChanges === 0) {
+    return { success: true, message: 'No changes detected.', results: [] };
+  }
+  
+  if (isDryRun) {
+    return { success: true, message: 'Dry run complete.', dryRun: true, analysis: analysis };
+  }
+  
+  // Save all changes to ScriptProperties so chunked runs can access them
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('PUSH_CHANGES', JSON.stringify(analysis.changes));
+  props.setProperty('PUSH_INDEX', '0');
+  props.setProperty('PUSH_RESULTS', JSON.stringify([]));
+  props.setProperty('PUSH_TOTAL', analysis.changes.length.toString());
+  props.setProperty('PUSH_RUNNING', 'true');
+  
+  // Run the first batch
+  const batchResult = executePushBatch_();
+  
+  return batchResult;
+}
+
+function executePushBatch_() {
+  const props = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const changes = JSON.parse(props.getProperty('PUSH_CHANGES') || '[]');
+  let startIndex = parseInt(props.getProperty('PUSH_INDEX') || '0');
+  let results = JSON.parse(props.getProperty('PUSH_RESULTS') || '[]');
+  const total = parseInt(props.getProperty('PUSH_TOTAL') || '0');
+  
+  if (changes.length === 0 || startIndex >= changes.length) {
+    finalizePush_();
+    return { success: true, message: 'No more products to push.', results: results };
+  }
+  
+  const token = getAccessToken_();
+  const config = getConfig_();
+  
+  const endIndex = Math.min(startIndex + PUSH_BATCH_SIZE, changes.length);
+  Logger.log(`📤 Push batch: products ${startIndex + 1} to ${endIndex} of ${changes.length}`);
+  
+  for (let i = startIndex; i < endIndex; i++) {
+    const product = changes[i];
+    try {
+      const mutation = buildUpdateMutation_(product);
+      const result = shopifyGraphQL_(token, config.shopDomain, mutation.query, mutation.variables);
+      
+      const userErrors = result.data?.productUpdate?.userErrors || [];
+      
+      if (userErrors.length > 0) {
+        results.push({
+          productId: product.productId,
+          handle: product.handle,
+          status: '❌ Error',
+          details: userErrors.map(e => `${e.field}: ${e.message}`).join('; ')
+        });
+      } else {
+        results.push({
+          productId: product.productId,
+          handle: product.handle,
+          status: '✅ Updated',
+          details: product.changes.map(c => c.field).join(', ')
+        });
+      }
+      
+      Utilities.sleep(500);
+      
+    } catch (e) {
+      results.push({
+        productId: product.productId,
+        handle: product.handle,
+        status: '❌ Failed',
+        details: e.message
+      });
+    }
+  }
+  
+  // Save progress
+  props.setProperty('PUSH_INDEX', endIndex.toString());
+  props.setProperty('PUSH_RESULTS', JSON.stringify(results));
+  
+  // Check if more batches needed
+  if (endIndex < changes.length) {
+    // Schedule next batch in 10 seconds via trigger
+    Logger.log(`⏳ ${changes.length - endIndex} products remaining. Scheduling next batch...`);
+    
+    // Clean up old triggers first
+    cleanPushTriggers_();
+    
+    // Create a new trigger to continue
+    ScriptApp.newTrigger('continuePush')
+      .timeBased()
+      .after(10 * 1000) // 10 seconds
+      .create();
+    
+    // Write intermediate results
+    writePushResults_(ss, results);
+    logAction_(ss, 'PUSH (batch)', `${endIndex} of ${changes.length} processed so far`, '🔄 In progress');
+    
+    return { 
+      success: true, 
+      message: `Batch complete: ${endIndex} of ${changes.length} products processed. Next batch auto-scheduled.`,
+      results: results,
+      inProgress: true,
+      processed: endIndex,
+      total: changes.length
+    };
+  } else {
+    // All done
+    finalizePush_();
+    return {
+      success: true,
+      message: `Push complete. ${results.filter(r => r.status.includes('✅')).length} updated, ${results.filter(r => r.status.includes('❌')).length} failed.`,
+      results: results,
+      inProgress: false
+    };
+  }
+}
+
+// Called automatically by the time trigger for subsequent batches
+function continuePush() {
+  cleanPushTriggers_();
+  
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('PUSH_RUNNING') !== 'true') return;
+  
+  executePushBatch_();
+}
+
+function finalizePush_() {
+  const props = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const results = JSON.parse(props.getProperty('PUSH_RESULTS') || '[]');
+  
+  const successCount = results.filter(r => r.status.includes('✅')).length;
+  const failCount = results.filter(r => r.status.includes('❌')).length;
+  
+  logAction_(ss, 'PUSH (complete)', `${successCount} succeeded, ${failCount} failed out of ${results.length} products`, 
+    failCount === 0 ? '✅ Success' : '⚠️ Partial');
+  
+  writePushResults_(ss, results);
+  
+  // Clean up
+  props.deleteProperty('PUSH_CHANGES');
+  props.deleteProperty('PUSH_INDEX');
+  props.deleteProperty('PUSH_RESULTS');
+  props.deleteProperty('PUSH_TOTAL');
+  props.setProperty('PUSH_RUNNING', 'false');
+  
+  cleanPushTriggers_();
+  
+  Logger.log(`✅ Push finalized. ${successCount} updated, ${failCount} failed.`);
+}
+
+function cleanPushTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'continuePush') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+// Check push status (called from sidebar)
+function getPushStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const running = props.getProperty('PUSH_RUNNING') === 'true';
+  const index = parseInt(props.getProperty('PUSH_INDEX') || '0');
+  const total = parseInt(props.getProperty('PUSH_TOTAL') || '0');
+  const results = JSON.parse(props.getProperty('PUSH_RESULTS') || '[]');
+  
+  return { running, processed: index, total, results };
+}
+
+// Cancel an in-progress push
+function cancelPush() {
+  finalizePush_();
+  return { success: true, message: 'Push cancelled.' };
+}
+
+// ── BUILD UPDATE MUTATION ───────────────────────────────────
+
+function buildUpdateMutation_(product) {
+  const productInput = {
+    id: product.productId
+  };
+  
+  const metafields = [];
+  
+  product.changes.forEach(change => {
+    if (change.field === 'Title') {
+      productInput.title = change.newValue;
+    }
+    else if (change.field === 'Tags') {
+      // Tags are comma-separated in the sheet, need to be an array
+      productInput.tags = change.newValue.split(',').map(t => t.trim()).filter(t => t);
+    }
+    else if (change.field === 'Category ID') {
+      productInput.category = change.newValue;
+    }
+    else if (change.field === 'Vendor') {
+      productInput.vendor = change.newValue;
+    }
+    else if (change.field === 'Product Type') {
+      productInput.productType = change.newValue;
+    }
+    else if (change.field === 'Status') {
+      productInput.status = change.newValue.toUpperCase();
+    }
+    else if (change.field === 'Description (HTML)') {
+      productInput.descriptionHtml = change.newValue;
+    }
+    else if (change.field === 'SEO Title') {
+      if (!productInput.seo) productInput.seo = {};
+      productInput.seo.title = change.newValue;
+    }
+    else if (change.field === 'SEO Description') {
+      if (!productInput.seo) productInput.seo = {};
+      productInput.seo.description = change.newValue;
+    }
+    else if (change.field.startsWith('MF: ')) {
+      // Metafield: "MF: namespace.key"
+      const fullKey = change.field.replace('MF: ', '');
+      const dotIndex = fullKey.indexOf('.');
+      const namespace = fullKey.substring(0, dotIndex);
+      const key = fullKey.substring(dotIndex + 1);
+      
+      metafields.push({
+        namespace: namespace,
+        key: key,
+        value: change.newValue,
+        type: 'single_line_text_field' // Default — will be overridden for existing metafields
+      });
+    }
+  });
+  
+  if (metafields.length > 0) {
+    productInput.metafields = metafields;
+  }
+  
+  const query = `
+    mutation UpdateProduct($product: ProductInput!) {
+      productUpdate(input: $product) {
+        product {
+          id
+          title
+          tags
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+  
+  return { query, variables: { product: productInput } };
+}
+
+// ── WRITE PUSH RESULTS ──────────────────────────────────────
+
+function writePushResults_(ss, results) {
+  let sheet = ss.getSheetByName('Push Results');
+  if (!sheet) sheet = ss.insertSheet('Push Results');
+  sheet.clear();
+  
+  const headers = ['Timestamp', 'Product ID', 'Handle', 'Status', 'Details'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e8e8e8');
+  
+  const now = new Date();
+  const rows = results.map(r => [now, r.productId, r.handle, r.status, r.details]);
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+  
+  for (let i = 1; i <= headers.length; i++) sheet.autoResizeColumn(i);
+}
+
+// ── DRY RUN FROM MENU ──────────────────────────────────────
+
+function dryRunPush() {
+  try {
+    const result = executePush(true);
+    const a = result.analysis;
+    
+    let msg = `DRY RUN RESULTS\n\n`;
+    msg += `Push tab rows: ${a.totalPushRows}\n`;
+    msg += `Products with changes: ${a.productsWithChanges}\n`;
+    msg += `Total field changes: ${a.totalChanges}\n`;
+    msg += `Data was pulled at: ${a.pullTimestamp}\n\n`;
+    
+    if (a.changes.length > 0) {
+      msg += `CHANGES DETECTED:\n\n`;
+      a.changes.slice(0, 10).forEach(c => {
+        msg += `${c.handle}:\n`;
+        c.changes.forEach(ch => {
+          const oldVal = ch.oldValue.substring(0, 30) || '(empty)';
+          const newVal = ch.newValue.substring(0, 30) || '(empty)';
+          msg += `  ${ch.field}: "${oldVal}" → "${newVal}"\n`;
+        });
+        msg += '\n';
+      });
+      if (a.changes.length > 10) {
+        msg += `... and ${a.changes.length - 10} more products.\n`;
+      }
+    }
+    
+    SpreadsheetApp.getUi().alert(msg);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('❌ ' + e.message);
+  }
+}
+
+// ── PUSH SIDEBAR HTML ───────────────────────────────────────
+
+function getPushSidebarHtml_() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; color: #1a1a1a; padding: 16px; background: #fff; }
+  
+  h2 { font-size: 16px; margin-bottom: 4px; }
+  .subtitle { font-size: 12px; color: #888; margin-bottom: 16px; }
+  
+  .info-box { padding: 12px; background: #f0f7ff; border: 1px solid #c0d8f0; border-radius: 8px; margin-bottom: 16px; font-size: 12px; line-height: 1.5; }
+  .warning-box { padding: 12px; background: #fff8f0; border: 1px solid #f0d8c0; border-radius: 8px; margin-bottom: 16px; font-size: 12px; line-height: 1.5; }
+  .error-box { padding: 12px; background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 8px; margin-bottom: 16px; font-size: 12px; }
+  .success-box { padding: 12px; background: #f0fff0; border: 1px solid #c0f0c0; border-radius: 8px; margin-bottom: 16px; font-size: 12px; }
+  
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+  .stat { padding: 12px; background: #f8f8f8; border-radius: 8px; text-align: center; }
+  .stat-value { font-size: 24px; font-weight: 700; }
+  .stat-label { font-size: 11px; color: #888; margin-top: 2px; }
+  
+  .change-list { max-height: 350px; overflow-y: auto; margin-bottom: 16px; }
+  .change-item { padding: 10px; border: 1px solid #e5e5e5; border-radius: 6px; margin-bottom: 6px; }
+  .change-handle { font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+  .change-detail { font-size: 11px; color: #555; padding: 2px 0; }
+  .old-val { color: #cc3333; text-decoration: line-through; }
+  .new-val { color: #339933; font-weight: 500; }
+  .arrow { color: #888; margin: 0 4px; }
+  
+  .btn { display: block; width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+  .btn-analyze { background: #f0f0f0; color: #333; }
+  .btn-analyze:hover { background: #e5e5e5; }
+  .btn-dryrun { background: #e8e8ff; color: #333; }
+  .btn-dryrun:hover { background: #d8d8ff; }
+  .btn-push { background: #1a1a1a; color: #fff; }
+  .btn-push:hover { background: #333; }
+  .btn-push:disabled { background: #ccc; cursor: not-allowed; }
+  .btn-danger { background: #cc3333; color: #fff; }
+  .btn-danger:hover { background: #aa2222; }
+  
+  .loading { text-align: center; padding: 20px; color: #888; }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #e0e0e0; border-top-color: #333; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  
+  .step { padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+  .step-num { display: inline-block; width: 20px; height: 20px; background: #e8e8e8; border-radius: 50%; text-align: center; font-size: 11px; line-height: 20px; font-weight: 600; margin-right: 6px; }
+  .step.active .step-num { background: #1a1a1a; color: #fff; }
+  .step.done .step-num { background: #339933; color: #fff; }
+</style>
+</head>
+<body>
+
+<h2>📤 Push to Shopify</h2>
+<p class="subtitle">Push changes from the Push tab back to your store.</p>
+
+<div class="info-box">
+  <strong>How it works:</strong><br>
+  1. Copy rows from <strong>Data</strong> tab to a tab named <strong>Push</strong><br>
+  2. Edit the values you want to change in the Push tab<br>
+  3. Click <strong>Analyze</strong> to see what changed<br>
+  4. Click <strong>Dry Run</strong> to preview, then <strong>Push</strong> to apply
+</div>
+
+<div id="content">
+  <button class="btn btn-analyze" onclick="analyze()">🔍 Analyze Changes</button>
+</div>
+
+<div id="results"></div>
+
+<script>
+  let analysisData = null;
+  
+  function analyze() {
+    const content = document.getElementById('results');
+    content.innerHTML = '<div class="loading"><div class="spinner"></div><p style="margin-top:8px">Comparing Push tab to Data tab...</p></div>';
+    
+    google.script.run
+      .withSuccessHandler(onAnalyzed)
+      .withFailureHandler(onError)
+      .analyzePushChanges();
+  }
+  
+  function onAnalyzed(data) {
+    analysisData = data;
+    const el = document.getElementById('results');
+    
+    if (data.productsWithChanges === 0) {
+      el.innerHTML = '<div class="info-box">✅ No changes detected. The Push tab matches the Data tab.</div>';
+      return;
+    }
+    
+    // Calculate hours since pull
+    const pullDate = new Date(data.pullTimestamp);
+    const hoursSincePull = Math.round((new Date() - pullDate) / (1000 * 60 * 60));
+    
+    let html = '';
+    
+    // Warning if data is stale
+    if (hoursSincePull > 24) {
+      html += '<div class="warning-box">⚠️ <strong>Stale data warning!</strong> Your Data tab was pulled ' + hoursSincePull + ' hours ago. Consider doing a fresh Pull before pushing.</div>';
+    }
+    
+    // Stats
+    html += '<div class="stats">';
+    html += '<div class="stat"><div class="stat-value">' + data.productsWithChanges + '</div><div class="stat-label">Products to update</div></div>';
+    html += '<div class="stat"><div class="stat-value">' + data.totalChanges + '</div><div class="stat-label">Field changes</div></div>';
+    html += '</div>';
+    
+    // Show pushable vs read-only columns
+    if (data.pushableColumns && data.pushableColumns.length > 0) {
+      html += '<div style="font-size:11px; margin-bottom:12px; padding:8px; background:#f8f8f8; border-radius:6px;">';
+      html += '<strong style="color:#339933;">✎ Pushable:</strong> ' + data.pushableColumns.join(', ');
+      if (data.readOnlyColumns && data.readOnlyColumns.length > 0) {
+        html += '<br><strong style="color:#999;">🔒 Read-only:</strong> ' + data.readOnlyColumns.join(', ');
+      }
+      html += '</div>';
+    }
+    
+    // Change list
+    html += '<div class="change-list">';
+    data.changes.forEach(function(product) {
+      html += '<div class="change-item">';
+      html += '<div class="change-handle">' + escapeHtml(product.handle) + '</div>';
+      product.changes.forEach(function(ch) {
+        const oldV = ch.oldValue ? ch.oldValue.substring(0, 40) : '(empty)';
+        const newV = ch.newValue ? ch.newValue.substring(0, 40) : '(empty)';
+        html += '<div class="change-detail">';
+        html += '<strong>' + escapeHtml(ch.field) + ':</strong> ';
+        html += '<span class="old-val">' + escapeHtml(oldV) + '</span>';
+        html += '<span class="arrow">→</span>';
+        html += '<span class="new-val">' + escapeHtml(newV) + '</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+    html += '</div>';
+    
+    // Action buttons
+    html += '<button class="btn btn-push" onclick="confirmAndPush()">📤 Push ' + data.productsWithChanges + ' Products to Shopify</button>';
+    html += '<button class="btn btn-analyze" onclick="analyze()" style="margin-top:6px">🔄 Re-analyze</button>';
+    
+    el.innerHTML = html;
+  }
+  
+  function confirmAndPush() {
+    if (!analysisData || analysisData.productsWithChanges === 0) return;
+    
+    const confirmed = confirm(
+      'CONFIRM PUSH\\n\\n' +
+      'You are about to update ' + analysisData.productsWithChanges + ' products in Shopify.\\n' +
+      'Total field changes: ' + analysisData.totalChanges + '\\n\\n' +
+      (analysisData.productsWithChanges > 200 ? 'This will run in batches of 200 (auto-chained).\\n\\n' : '') +
+      'This CANNOT be undone. Continue?'
+    );
+    
+    if (!confirmed) return;
+    
+    const el = document.getElementById('results');
+    el.innerHTML = '<div class="loading"><div class="spinner"></div><p style="margin-top:8px">Pushing changes to Shopify...</p><p style="font-size:11px; color:#aaa">Processing batch 1...</p></div>';
+    
+    google.script.run
+      .withSuccessHandler(onPushComplete)
+      .withFailureHandler(onError)
+      .executePush(false);
+  }
+  
+  function onPushComplete(result) {
+    const el = document.getElementById('results');
+    let html = '';
+    
+    if (result.inProgress) {
+      // Show progress and start polling
+      html += '<div class="info-box">🔄 <strong>Push in progress...</strong><br>' + result.processed + ' of ' + result.total + ' products processed.<br>Next batch auto-scheduled. This panel will update automatically.</div>';
+      
+      // Progress bar
+      const pct = Math.round((result.processed / result.total) * 100);
+      html += '<div style="background:#e8e8e8; border-radius:8px; height:24px; margin-bottom:16px; overflow:hidden;">';
+      html += '<div style="background:#1a1a1a; height:100%; width:' + pct + '%; border-radius:8px; transition:width 0.5s; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:600;">' + pct + '%</div>';
+      html += '</div>';
+      
+      // Cancel button
+      html += '<button class="btn btn-analyze" onclick="cancelPush()">⛔ Cancel Push</button>';
+      
+      // Start polling for updates
+      setTimeout(pollPushStatus, 15000);
+      
+      el.innerHTML = html;
+      return;
+    }
+    
+    // Push is complete
+    if (result.results) {
+      const successes = result.results.filter(r => r.status.includes('✅'));
+      const failures = result.results.filter(r => r.status.includes('❌'));
+      
+      if (failures.length === 0) {
+        html += '<div class="success-box">✅ <strong>All ' + successes.length + ' products updated successfully!</strong><br>Check the "Push Results" tab for details. Do a fresh Pull to update the Data tab.</div>';
+      } else {
+        html += '<div class="warning-box">⚠️ <strong>' + successes.length + ' succeeded, ' + failures.length + ' failed.</strong><br>Check the "Push Results" tab for details.</div>';
+      }
+      
+      // Show results summary (limit to 20 to avoid huge sidebar)
+      html += '<div class="change-list">';
+      result.results.slice(0, 20).forEach(function(r) {
+        html += '<div class="change-item">';
+        html += '<div class="change-handle">' + r.status + ' ' + escapeHtml(r.handle) + '</div>';
+        html += '<div class="change-detail">' + escapeHtml(r.details) + '</div>';
+        html += '</div>';
+      });
+      if (result.results.length > 20) {
+        html += '<div style="text-align:center; padding:8px; color:#888; font-size:12px;">... and ' + (result.results.length - 20) + ' more. See "Push Results" tab.</div>';
+      }
+      html += '</div>';
+    } else {
+      html += '<div class="info-box">' + escapeHtml(result.message) + '</div>';
+    }
+    
+    html += '<button class="btn btn-analyze" onclick="analyze()">🔍 Analyze Again</button>';
+    el.innerHTML = html;
+  }
+  
+  function pollPushStatus() {
+    google.script.run
+      .withSuccessHandler(function(status) {
+        if (!status.running) {
+          // Push finished — show final results
+          onPushComplete({ success: true, results: status.results, inProgress: false });
+          return;
+        }
+        
+        // Update progress
+        const el = document.getElementById('results');
+        const pct = Math.round((status.processed / status.total) * 100);
+        const successes = status.results.filter(function(r) { return r.status.includes('✅'); }).length;
+        const failures = status.results.filter(function(r) { return r.status.includes('❌'); }).length;
+        
+        let html = '<div class="info-box">🔄 <strong>Push in progress...</strong><br>' + status.processed + ' of ' + status.total + ' products processed.<br>' + successes + ' succeeded, ' + failures + ' failed so far.</div>';
+        html += '<div style="background:#e8e8e8; border-radius:8px; height:24px; margin-bottom:16px; overflow:hidden;">';
+        html += '<div style="background:#1a1a1a; height:100%; width:' + pct + '%; border-radius:8px; transition:width 0.5s; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:600;">' + pct + '%</div>';
+        html += '</div>';
+        html += '<button class="btn btn-analyze" onclick="cancelPush()">⛔ Cancel Push</button>';
+        
+        el.innerHTML = html;
+        
+        // Continue polling
+        setTimeout(pollPushStatus, 15000);
+      })
+      .withFailureHandler(function() {
+        setTimeout(pollPushStatus, 15000);
+      })
+      .getPushStatus();
+  }
+  
+  function cancelPush() {
+    if (!confirm('Cancel the push? Products already updated will stay updated.')) return;
+    google.script.run
+      .withSuccessHandler(function(result) {
+        document.getElementById('results').innerHTML = '<div class="warning-box">⛔ Push cancelled. Check "Push Results" tab for what was processed.</div><button class="btn btn-analyze" onclick="analyze()">🔍 Analyze Again</button>';
+      })
+      .withFailureHandler(onError)
+      .cancelPush();
+  }
+  
+  function onError(err) {
+    document.getElementById('results').innerHTML = '<div class="error-box">❌ ' + escapeHtml(err.message) + '</div><button class="btn btn-analyze" onclick="analyze()">🔍 Try Again</button>';
+  }
+  
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+</script>
+
+</body>
+</html>`;
+}
+
+// ── PULL SIDEBAR HTML ───────────────────────────────────────
+
+function getSidebarHtml_() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; color: #1a1a1a; padding: 16px; background: #fff; }
+  
+  h2 { font-size: 16px; margin-bottom: 12px; color: #1a1a1a; }
+  h3 { font-size: 13px; font-weight: 600; margin: 16px 0 8px 0; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+  
+  .loading { text-align: center; padding: 40px 0; color: #888; }
+  .spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid #e0e0e0; border-top-color: #333; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  
+  .section { margin-bottom: 16px; border: 1px solid #e5e5e5; border-radius: 8px; overflow: hidden; }
+  .section-header { padding: 10px 12px; background: #f8f8f8; font-weight: 600; font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+  .section-header:hover { background: #f0f0f0; }
+  .section-header .arrow { transition: transform 0.2s; }
+  .section-header.collapsed .arrow { transform: rotate(-90deg); }
+  .section-body { padding: 8px 12px; max-height: 200px; overflow-y: auto; }
+  .section-body.collapsed { display: none; }
+  
+  .check-item { display: flex; align-items: center; padding: 4px 0; }
+  .check-item label { margin-left: 6px; flex: 1; cursor: pointer; }
+  .check-item .count { color: #999; font-size: 11px; margin-left: 4px; }
+  .check-item input[type=checkbox] { cursor: pointer; }
+  
+  .select-all { font-size: 11px; color: #0066cc; cursor: pointer; text-decoration: underline; }
+  
+  .btn { display: block; width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+  .btn-primary { background: #1a1a1a; color: #fff; }
+  .btn-primary:hover { background: #333; }
+  .btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+  .btn-secondary { background: #f0f0f0; color: #333; }
+  .btn-secondary:hover { background: #e5e5e5; }
+  
+  .preview-box { margin-top: 12px; padding: 12px; background: #f9f9f9; border-radius: 8px; border: 1px solid #e5e5e5; font-size: 12px; max-height: 300px; overflow-y: auto; }
+  .preview-box .field { margin-bottom: 4px; }
+  .preview-box .field-label { font-weight: 600; color: #555; }
+  .preview-box .field-value { color: #1a1a1a; word-break: break-all; }
+  
+  .status-bar { position: sticky; bottom: 0; background: #fff; padding: 12px 0 0 0; border-top: 1px solid #e5e5e5; margin-top: 16px; }
+  .status-text { text-align: center; font-size: 12px; color: #888; margin-bottom: 8px; }
+  
+  .tag { display: inline-block; padding: 2px 8px; background: #f0f0f0; border-radius: 12px; font-size: 11px; margin: 2px; }
+</style>
+</head>
+<body>
+
+<div id="loading" class="loading">
+  <div class="spinner"></div>
+  <p style="margin-top:12px">Scanning your store...</p>
+  <p style="font-size:11px; color:#aaa; margin-top:4px">Fetching product types, tags, vendors, metafields</p>
+</div>
+
+<div id="main" style="display:none">
+  <h2>Pull Products</h2>
+  <p style="font-size:12px; color:#888; margin-bottom:16px;">Select your filters and fields, then pull.</p>
+  
+  <!-- FILTERS -->
+  <div class="section">
+    <div class="section-header" onclick="toggleSection(this)">
+      🔍 Filters <span class="arrow">▼</span>
+    </div>
+    <div class="section-body">
+      
+      <!-- Status -->
+      <h3>Status</h3>
+      <div id="statusFilters"></div>
+      
+      <!-- Product Type -->
+      <h3>Product Type <span class="select-all" onclick="toggleAll('ptFilter')">toggle all</span></h3>
+      <div id="productTypeFilters"></div>
+      
+      <!-- Vendor -->
+      <h3>Vendor <span class="select-all" onclick="toggleAll('vendorFilter')">toggle all</span></h3>
+      <div id="vendorFilters"></div>
+      
+      <!-- Tags -->
+      <h3>Tags <span class="select-all" onclick="toggleAll('tagFilter')">toggle all</span></h3>
+      <div id="tagFilters" style="max-height:150px; overflow-y:auto;"></div>
+    </div>
+  </div>
+  
+  <!-- FIELDS -->
+  <div class="section">
+    <div class="section-header" onclick="toggleSection(this)">
+      📋 Fields to Pull <span class="arrow">▼</span>
+    </div>
+    <div class="section-body">
+      <div id="fieldSelectors"></div>
+    </div>
+  </div>
+  
+  <!-- METAFIELDS -->
+  <div class="section">
+    <div class="section-header" onclick="toggleSection(this)">
+      🏷️ Metafields <span class="select-all" onclick="event.stopPropagation(); toggleAll('mfKey')" style="margin-left:auto; margin-right:8px;">toggle all</span> <span class="arrow">▼</span>
+    </div>
+    <div class="section-body" id="metafieldSelectors" style="max-height:250px; overflow-y:auto;"></div>
+  </div>
+  
+  <!-- PREVIEW -->
+  <button class="btn btn-secondary" onclick="loadPreview()">👁️ Preview Sample Product</button>
+  <div id="previewArea"></div>
+  
+  <!-- ACTIONS -->
+  <div class="status-bar">
+    <div class="status-text" id="statusText">Ready</div>
+    <button class="btn btn-primary" id="pullBtn" onclick="executePull()">📥 Pull Products</button>
+  </div>
+</div>
+
+<script>
+  let storeData = null;
+  
+  // ── INIT ──
+  google.script.run
+    .withSuccessHandler(onMetadataLoaded)
+    .withFailureHandler(onError)
+    .fetchStoreMetadata();
+  
+  function onMetadataLoaded(data) {
+    storeData = data;
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('main').style.display = 'block';
+    
+    // Render status filters
+    renderCheckboxes('statusFilters', data.statuses, 'statusFilter', true);
+    
+    // Render product type filters
+    renderCheckboxes('productTypeFilters', data.productTypes, 'ptFilter', false);
+    
+    // Render vendor filters
+    renderCheckboxes('vendorFilters', data.vendors, 'vendorFilter', false);
+    
+    // Render tag filters
+    renderCheckboxes('tagFilters', data.tags, 'tagFilter', false);
+    
+    // Render field selectors
+    renderFieldSelectors();
+    
+    // Render metafield selectors
+    renderCheckboxes('metafieldSelectors', data.metafieldKeys, 'mfKey', true);
+    
+    document.getElementById('statusText').textContent = data.totalProducts + ' products in store';
+  }
+  
+  function onError(err) {
+    document.getElementById('loading').innerHTML = '<p style="color:red">❌ ' + err.message + '</p>';
+  }
+  
+  // ── RENDER CHECKBOXES ──
+  function renderCheckboxes(containerId, items, namePrefix, checkedByDefault) {
+    const container = document.getElementById(containerId);
+    if (!items || items.length === 0) {
+      container.innerHTML = '<p style="color:#aaa; font-size:12px;">None found</p>';
+      return;
+    }
+    
+    container.innerHTML = items.map((item, i) => {
+      const checked = checkedByDefault ? 'checked' : '';
+      const id = namePrefix + '_' + i;
+      return '<div class="check-item">' +
+        '<input type="checkbox" id="' + id + '" name="' + namePrefix + '" value="' + escapeHtml(item.name) + '" ' + checked + '>' +
+        '<label for="' + id + '">' + escapeHtml(item.name) + ' <span class="count">(' + item.count + ')</span></label>' +
+      '</div>';
+    }).join('');
+  }
+  
+  // ── FIELD SELECTORS ──
+  function renderFieldSelectors() {
+    const fields = [
+      { key: 'sku', label: 'SKU', default: true },
+      { key: 'title', label: 'Title', default: true },
+      { key: 'productType', label: 'Product Type', default: true },
+      { key: 'status', label: 'Status', default: true },
+      { key: 'tags', label: 'Tags', default: true },
+      { key: 'vendor', label: 'Vendor', default: true },
+      { key: 'category', label: 'Category', default: true },
+      { key: 'images', label: 'Images (first 3 URLs)', default: true },
+      { key: 'metafields', label: 'Metafields', default: true },
+      { key: 'variants', label: 'Variants', default: false },
+      { key: 'descriptionHtml', label: 'Description (HTML)', default: false },
+      { key: 'seo', label: 'SEO Title & Description', default: false },
+    ];
+    
+    const container = document.getElementById('fieldSelectors');
+    container.innerHTML = fields.map(f => {
+      const checked = f.default ? 'checked' : '';
+      return '<div class="check-item">' +
+        '<input type="checkbox" id="field_' + f.key + '" name="field" value="' + f.key + '" ' + checked + '>' +
+        '<label for="field_' + f.key + '">' + f.label + '</label>' +
+      '</div>';
+    }).join('');
+  }
+  
+  // ── TOGGLE HELPERS ──
+  function toggleSection(header) {
+    header.classList.toggle('collapsed');
+    header.nextElementSibling.classList.toggle('collapsed');
+  }
+  
+  function toggleAll(namePrefix) {
+    const checkboxes = document.querySelectorAll('input[name="' + namePrefix + '"]');
+    const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+    checkboxes.forEach(cb => cb.checked = !allChecked);
+  }
+  
+  // ── GET SELECTED VALUES ──
+  function getSelected(namePrefix) {
+    return Array.from(document.querySelectorAll('input[name="' + namePrefix + '"]:checked'))
+      .map(cb => cb.value);
+  }
+  
+  // ── PREVIEW ──
+  function loadPreview() {
+    const area = document.getElementById('previewArea');
+    area.innerHTML = '<div class="preview-box"><div class="loading"><div class="spinner"></div></div></div>';
+    
+    const selectedTypes = getSelected('ptFilter');
+    const type = selectedTypes.length === 1 ? selectedTypes[0] : '';
+    
+    google.script.run
+      .withSuccessHandler(renderPreview)
+      .withFailureHandler(e => { area.innerHTML = '<p style="color:red">❌ ' + e.message + '</p>'; })
+      .fetchSampleProduct(type);
+  }
+  
+  function renderPreview(product) {
+    const area = document.getElementById('previewArea');
+    if (!product) {
+      area.innerHTML = '<div class="preview-box">No products found</div>';
+      return;
+    }
+    
+    let html = '<div class="preview-box">';
+    html += '<div style="font-weight:600; margin-bottom:8px;">📦 ' + escapeHtml(product.title) + '</div>';
+    html += field('Handle', product.handle);
+    html += field('Type', product.productType);
+    html += field('Status', product.status);
+    html += field('Tags', product.tags);
+    html += field('Vendor', product.vendor);
+    html += field('Category', product.category);
+    
+    if (product.images.length > 0) {
+      html += '<div class="field"><span class="field-label">Images:</span> ' + product.images.length + ' images</div>';
+    }
+    
+    if (product.metafields.length > 0) {
+      html += '<div style="margin-top:8px; font-weight:600;">Metafields:</div>';
+      product.metafields.forEach(mf => {
+        html += '<div class="field"><span class="field-label">' + escapeHtml(mf.key) + ':</span> <span class="field-value">' + escapeHtml(mf.value) + '</span></div>';
+      });
+    }
+    
+    html += '</div>';
+    area.innerHTML = html;
+  }
+  
+  function field(label, value) {
+    return '<div class="field"><span class="field-label">' + label + ':</span> <span class="field-value">' + escapeHtml(value || '(empty)') + '</span></div>';
+  }
+  
+  // ── EXECUTE PULL ──
+  function executePull() {
+    const btn = document.getElementById('pullBtn');
+    const status = document.getElementById('statusText');
+    btn.disabled = true;
+    status.textContent = '🔄 Pulling products...';
+    
+    // Gather selections
+    const options = {
+      filters: {
+        statuses: getSelected('statusFilter'),
+        productTypes: getSelected('ptFilter'),
+        vendors: getSelected('vendorFilter'),
+        tags: getSelected('tagFilter')
+      },
+      fields: {},
+      metafieldKeys: getSelected('mfKey')
+    };
+    
+    // Fields
+    const fieldCheckboxes = document.querySelectorAll('input[name="field"]:checked');
+    fieldCheckboxes.forEach(cb => { options.fields[cb.value] = true; });
+    
+    google.script.run
+      .withSuccessHandler(result => {
+        btn.disabled = false;
+        status.textContent = '✅ Pulled ' + result.count + ' products to Data tab';
+      })
+      .withFailureHandler(err => {
+        btn.disabled = false;
+        status.textContent = '❌ ' + err.message;
+      })
+      .executePull(options);
+  }
+  
+  // ── UTILS ──
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+</script>
+
+</body>
+</html>`;
+}
+// ── MAIN FUNCTION: BUILD TAXONOMY REFERENCE ─────────────────
+// This is the function that does all the work.
+// It runs when you click "Build Taxonomy Reference" in the menu.
+ 
+function buildTaxonomyReference() {
+  const ui = SpreadsheetApp.getUi();
+  
+  try {
+    ui.alert(
+      '🏷️ Building Taxonomy Reference',
+      'This will:\n\n' +
+      '1. Scan your products to find which categories are in use\n' +
+      '2. Fetch the available attributes for each category\n' +
+      '3. Fetch your store\'s metaobject entries\n' +
+      '4. Write everything to a "Taxonomy Reference" sheet\n\n' +
+      'This may take 1-3 minutes. Click OK to start.',
+      ui.ButtonSet.OK_CANCEL
+    ) === ui.Button.CANCEL && (() => { return; })();
+    
+    const token = getAccessToken_();
+    const config = getConfig_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // ── STEP 1: Find which categories your products use ─────
+    Logger.log('Step 1: Scanning product categories...');
+    const categoryMap = scanProductCategories_(token, config);
+    
+    if (Object.keys(categoryMap).length === 0) {
+      ui.alert('⚠️ No categorized products found.\n\nMake sure your products have a Category assigned in Shopify.');
+      return;
+    }
+    
+    // ── STEP 2: For each category, get its taxonomy attributes ─
+    Logger.log('Step 2: Fetching taxonomy attributes for each category...');
+    const taxonomyData = fetchTaxonomyAttributes_(token, config, categoryMap);
+    
+    // ── STEP 3: Fetch metaobject definitions & entries ───────
+    Logger.log('Step 3: Fetching metaobject entries from your store...');
+    const metaobjectData = fetchStoreMetaobjects_(token, config, taxonomyData);
+    
+    // ── STEP 4: Write to the Taxonomy Reference sheet ────────
+    Logger.log('Step 4: Writing to sheet...');
+    writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectData);
+    
+    // ── DONE ─────────────────────────────────────────────────
+    const catCount = Object.keys(categoryMap).length;
+    const attrCount = Object.values(taxonomyData).reduce((sum, attrs) => sum + attrs.length, 0);
+    
+    logAction_(ss, 'TAXONOMY REF', 
+      `${catCount} categories, ${attrCount} attributes scanned`, '✅ Success');
+    
+    ui.alert(
+      '✅ Taxonomy Reference Built!',
+      `Found:\n` +
+      `• ${catCount} product categories in use\n` +
+      `• ${attrCount} total attributes across those categories\n\n` +
+      `Check the "Taxonomy Reference" sheet.\n` +
+      `It has two sections:\n` +
+      `  📋 Top: Category → Attribute mapping\n` +
+      `  📋 Below: Attribute → Allowed Values with GIDs`,
+      ui.ButtonSet.OK
+    );
+    
+  } catch (e) {
+    ui.alert('❌ Failed to build taxonomy reference:\n\n' + e.message);
+    Logger.log('Taxonomy reference error: ' + e.stack);
+  }
+}
+ 
+ 
+// ── STEP 1 HELPER: Scan products to find categories in use ──
+// Goes through all products and collects unique category IDs
+// along with their names and how many products use each.
+ 
+function scanProductCategories_(token, config) {
+  const categoryMap = {};  // categoryId -> { name, fullName, productCount }
+  let cursor = null;
+  let hasNextPage = true;
+  
+  while (hasNextPage) {
+    const afterClause = cursor ? `, after: "${cursor}"` : '';
+    
+    const query = `{
+      products(first: 100${afterClause}) {
+        edges {
+          node {
+            category {
+              id
+              name
+              fullName
+            }
+          }
+          cursor
+        }
+        pageInfo { hasNextPage }
+      }
+    }`;
+    
+    const result = shopifyGraphQL_(token, config.shopDomain, query);
+    const edges = result.data.products.edges;
+    hasNextPage = result.data.products.pageInfo.hasNextPage;
+    
+    if (edges.length > 0) {
+      cursor = edges[edges.length - 1].cursor;
+    } else {
+      hasNextPage = false;
+    }
+    
+    edges.forEach(edge => {
+      const cat = edge.node.category;
+      if (cat && cat.id) {
+        if (!categoryMap[cat.id]) {
+          categoryMap[cat.id] = {
+            id: cat.id,
+            name: cat.name,
+            fullName: cat.fullName,
+            productCount: 0
+          };
+        }
+        categoryMap[cat.id].productCount++;
+      }
+    });
+    
+    Utilities.sleep(300);
+  }
+  
+  Logger.log(`Found ${Object.keys(categoryMap).length} unique categories`);
+  return categoryMap;
+}
+ 
+// ── FIXED STEP 2 HELPER (v4 — FINAL) ───────────────────────
+// REPLACE your existing fetchTaxonomyAttributes_ function with this one.
+//
+// The issue: TaxonomyAttribute (generic) doesn't have a 'name' field,
+// only TaxonomyChoiceListAttribute and TaxonomyMeasurementAttribute do.
+// Removed the generic fragment — we only need choice list attributes anyway.
+
+function fetchTaxonomyAttributes_(token, config, categoryMap) {
+  var taxonomyData = {};
+  var categoryIds = Object.keys(categoryMap);
+
+  for (var i = 0; i < categoryIds.length; i++) {
+    var catId = categoryIds[i];
+    var cat = categoryMap[catId];
+
+    Logger.log('  Fetching attributes for: ' + cat.name + ' (' + (i + 1) + '/' + categoryIds.length + ')');
+
+    if (catId === 'gid://shopify/TaxonomyCategory/na') {
+      taxonomyData[catId] = [];
+      Logger.log('    Skipping uncategorized');
+      continue;
+    }
+
+    var query = '{ node(id: "' + catId + '") { ... on TaxonomyCategory { id name fullName attributes(first: 50) { edges { node { ... on TaxonomyChoiceListAttribute { id name values(first: 250) { edges { node { id name } } } } ... on TaxonomyMeasurementAttribute { id name } } } } } } }';
+
+    try {
+      var result = shopifyGraphQL_(token, config.shopDomain, query);
+
+      if (!result.data.node) {
+        Logger.log('    node query returned null for ' + catId);
+        taxonomyData[catId] = [];
+        continue;
+      }
+
+      var catNode = result.data.node;
+      var attributes = [];
+
+      if (catNode.attributes && catNode.attributes.edges) {
+        catNode.attributes.edges.forEach(function(attrEdge) {
+          var attr = attrEdge.node;
+
+          if (attr.values) {
+            attributes.push({
+              id: attr.id,
+              name: attr.name,
+              values: attr.values.edges.map(function(vEdge) {
+                return { id: vEdge.node.id, name: vEdge.node.name };
+              })
+            });
+          } else if (attr.name) {
+            attributes.push({
+              id: attr.id,
+              name: attr.name,
+              type: 'non-choice',
+              values: []
+            });
+          }
+        });
+      }
+
+      taxonomyData[catId] = attributes;
+      Logger.log('    Found ' + attributes.length + ' attributes for ' + cat.name);
+
+    } catch (e) {
+      Logger.log('  Error fetching attributes for ' + cat.name + ': ' + e.message);
+      taxonomyData[catId] = [];
+    }
+
+    Utilities.sleep(500);
+  }
+
+  return taxonomyData;
+}
+ 
+ 
+// ── STEP 3 HELPER: Fetch metaobject entries from your store ──
+// Category metafields are stored as metaobject references.
+// Each attribute (like "Fabric") has a corresponding metaobject type
+// (like "shopify--fabric") in your store.
+//
+// This function:
+// 1. Lists all metaobject definitions that start with "shopify--"
+// 2. For each one, fetches all entries (the actual selectable values)
+// 3. Maps each entry to its display name and GID
+ 
+function fetchStoreMetaobjects_(token, config, taxonomyData) {
+  const metaobjectData = {};  // type -> [{ gid, displayName, handle, fields }]
+  
+  // First, get all standard (shopify--*) metaobject definitions
+  const defQuery = `{
+    metaobjectDefinitions(first: 100) {
+      edges {
+        node {
+          id
+          name
+          type
+          fieldDefinitions {
+            key
+            name
+            type { name }
+          }
+        }
+      }
+    }
+  }`;
+  
+  const defResult = shopifyGraphQL_(token, config.shopDomain, defQuery);
+  const allDefs = defResult.data.metaobjectDefinitions.edges.map(e => e.node);
+  
+  // Filter to only shopify-- standard definitions (category metafield types)
+  const standardDefs = allDefs.filter(d => d.type.startsWith('shopify--'));
+  
+  Logger.log(`Found ${standardDefs.length} standard metaobject definitions: ${standardDefs.map(d => d.type).join(', ')}`);
+  
+  // For each standard definition, fetch its entries
+  for (const def of standardDefs) {
+    Logger.log(`  Fetching entries for: ${def.type} (${def.name})`);
+    
+    let entries = [];
+    let cursor = null;
+    let hasNextPage = true;
+    
+    while (hasNextPage) {
+      const afterClause = cursor ? `, after: "${cursor}"` : '';
+      
+      const entryQuery = `{
+        metaobjects(type: "${def.type}", first: 100${afterClause}) {
+          edges {
+            node {
+              id
+              handle
+              displayName
+              fields {
+                key
+                value
+                type
+              }
+            }
+            cursor
+          }
+          pageInfo { hasNextPage }
+        }
+      }`;
+      
+      try {
+        const entryResult = shopifyGraphQL_(token, config.shopDomain, entryQuery);
+        const edges = entryResult.data.metaobjects.edges;
+        hasNextPage = entryResult.data.metaobjects.pageInfo.hasNextPage;
+        
+        if (edges.length > 0) {
+          cursor = edges[edges.length - 1].cursor;
+          edges.forEach(e => {
+            entries.push({
+              gid: e.node.id,
+              handle: e.node.handle,
+              displayName: e.node.displayName,
+              fields: e.node.fields
+            });
+          });
+        } else {
+          hasNextPage = false;
+        }
+        
+      } catch (e) {
+        Logger.log(`  Error fetching entries for ${def.type}: ${e.message}`);
+        hasNextPage = false;
+      }
+      
+      Utilities.sleep(300);
+    }
+    
+    metaobjectData[def.type] = {
+      definitionId: def.id,
+      name: def.name,
+      type: def.type,
+      fieldDefinitions: def.fieldDefinitions,
+      entries: entries
+    };
+    
+    Logger.log(`    Found ${entries.length} entries`);
+  }
+  
+  return metaobjectData;
+}
+ 
+ 
+// ── STEP 4 HELPER: Write the Taxonomy Reference sheet ────────
+// Creates (or overwrites) a sheet called "Taxonomy Reference" with:
+//
+// SECTION 1 — "Categories & Their Attributes"
+//   Shows which attributes are available for each category.
+//   Columns: Category ID | Category Name | Full Path | Products | Attribute | Attribute ID
+//
+// SECTION 2 — "Attribute Values (Your Store's Metaobject Entries)"
+//   Shows the allowed values for each attribute, with your store's GIDs.
+//   Columns: Metaobject Type | Attribute Name | Display Name | Metaobject GID | Handle
+//
+// This sheet is the "Rosetta Stone" — when you later pull category metafields,
+// the script uses this sheet to convert GIDs to readable names and back.
+ 
+function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectData) {
+  let sheet = ss.getSheetByName('Taxonomy Reference');
+  if (!sheet) {
+    sheet = ss.insertSheet('Taxonomy Reference');
+  }
+  sheet.clear();
+  
+  let currentRow = 1;
+  
+  // ── SECTION 1 HEADER ──
+  sheet.getRange(currentRow, 1).setValue('📋 SECTION 1: Categories & Their Attributes')
+    .setFontWeight('bold').setFontSize(12);
+  currentRow += 1;
+  
+  sheet.getRange(currentRow, 1).setValue('Shows which taxonomy attributes are available for each product category in your store.')
+    .setFontColor('#888888').setFontSize(10);
+  currentRow += 1;
+  
+  const sec1Headers = [
+    'Category ID', 'Category Name', 'Full Path', 'Products',
+    'Attribute Name', 'Attribute ID', 'Type', 'Value Count'
+  ];
+  sheet.getRange(currentRow, 1, 1, sec1Headers.length)
+    .setValues([sec1Headers])
+    .setFontWeight('bold')
+    .setBackground('#d9e2f3');
+  currentRow += 1;
+  
+  // ── SECTION 1 DATA ──
+  const sec1StartRow = currentRow;
+  
+  // Sort categories by product count (most products first)
+  const sortedCatIds = Object.keys(categoryMap).sort((a, b) => 
+    categoryMap[b].productCount - categoryMap[a].productCount
+  );
+  
+  for (const catId of sortedCatIds) {
+    const cat = categoryMap[catId];
+    const attrs = taxonomyData[catId] || [];
+    
+    if (attrs.length === 0) {
+      // Category has no attributes — still show it
+      sheet.getRange(currentRow, 1, 1, sec1Headers.length).setValues([[
+        catId, cat.name, cat.fullName, cat.productCount,
+        '(no attributes)', '', '', ''
+      ]]);
+      currentRow += 1;
+    } else {
+      for (const attr of attrs) {
+        const attrType = attr.type === 'non-choice' ? 'Measurement/Other' : 'Choice List';
+        sheet.getRange(currentRow, 1, 1, sec1Headers.length).setValues([[
+          catId, cat.name, cat.fullName, cat.productCount,
+          attr.name, attr.id, attrType, attr.values.length
+        ]]);
+        currentRow += 1;
+      }
+    }
+  }
+  
+  // Add a gap before section 2
+  currentRow += 2;
+  
+  // ── SECTION 2 HEADER ──
+  sheet.getRange(currentRow, 1).setValue('📋 SECTION 2: Attribute Values (Metaobject Entries in Your Store)')
+    .setFontWeight('bold').setFontSize(12);
+  currentRow += 1;
+  
+  sheet.getRange(currentRow, 1).setValue('These are the actual values available in dropdowns. The Metaobject GID is what the API needs when pushing.')
+    .setFontColor('#888888').setFontSize(10);
+  currentRow += 1;
+  
+  const sec2Headers = [
+    'Metaobject Type', 'Attribute Name', 'Display Name', 
+    'Metaobject GID', 'Handle'
+  ];
+  sheet.getRange(currentRow, 1, 1, sec2Headers.length)
+    .setValues([sec2Headers])
+    .setFontWeight('bold')
+    .setBackground('#e2f0d9');
+  currentRow += 1;
+  
+  // ── SECTION 2 DATA ──
+  // Sort metaobject types alphabetically
+  const sortedTypes = Object.keys(metaobjectData).sort();
+  
+  for (const moType of sortedTypes) {
+    const mo = metaobjectData[moType];
+    
+    if (mo.entries.length === 0) {
+      sheet.getRange(currentRow, 1, 1, sec2Headers.length).setValues([[
+        moType, mo.name, '(no entries)', '', ''
+      ]]);
+      currentRow += 1;
+    } else {
+      // Sort entries by display name
+      const sortedEntries = mo.entries.sort((a, b) => 
+        (a.displayName || '').localeCompare(b.displayName || '')
+      );
+      
+      for (const entry of sortedEntries) {
+        sheet.getRange(currentRow, 1, 1, sec2Headers.length).setValues([[
+          moType, mo.name, entry.displayName, entry.gid, entry.handle
+        ]]);
+        currentRow += 1;
+      }
+    }
+  }
+  
+  // ── FORMATTING ──
+  // Auto-resize the important columns
+  for (let i = 1; i <= Math.max(sec1Headers.length, sec2Headers.length); i++) {
+    try { sheet.autoResizeColumn(i); } catch (e) { /* ignore */ }
+  }
+  
+  // Freeze the first row area isn't useful here since we have two sections,
+  // but we can at least add a timestamp
+  currentRow += 2;
+  sheet.getRange(currentRow, 1).setValue('Last refreshed:').setFontWeight('bold');
+  sheet.getRange(currentRow, 2).setValue(new Date());
+  
+  // Set sheet tab color to distinguish it
+  sheet.setTabColor('#9fc5e8');
+}
