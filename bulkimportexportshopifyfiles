@@ -419,11 +419,11 @@ function executePull(options) {
 // ── WRITE DATA TO SHEET ─────────────────────────────────────
 
 function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
-  let dataSheet = ss.getSheetByName('Data');
+  var dataSheet = ss.getSheetByName('Data');
   if (!dataSheet) dataSheet = ss.insertSheet('Data');
   
   // Remove existing protection so we can write
-  dataSheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(p => {
+  dataSheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(function(p) {
     if (p.canEdit()) p.remove();
   });
   
@@ -434,8 +434,12 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
     return;
   }
   
+  // Load taxonomy reference for GID translation
+  var taxRef = loadTaxonomyReference_();
+  var gidToDisplayName = taxRef ? taxRef.gidToDisplayName : {};
+  
   // Build headers
-  const headers = ['Product ID', 'Handle'];
+  var headers = ['Product ID', 'Handle'];
   if (fields.sku) headers.push('SKU');
   if (fields.title) headers.push('Title');
   if (fields.productType) headers.push('Product Type');
@@ -447,32 +451,58 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
   if (fields.seo) headers.push('SEO Title', 'SEO Description');
   if (fields.images) headers.push('Image 1', 'Image 2', 'Image 3');
   
-  // Metafield columns
-  let metafieldKeys = [];
+  // ── Separate metafield keys into CATEGORY (shopify.*) and REGULAR ──
+  var categoryMetafieldKeys = [];
+  var regularMetafieldKeys = [];
+  
   if (fields.metafields) {
+    var allMetafieldKeys = [];
+    
     if (selectedMetafieldKeys && selectedMetafieldKeys.length > 0) {
-      metafieldKeys = selectedMetafieldKeys;
+      allMetafieldKeys = selectedMetafieldKeys;
     } else {
       // Discover all keys from data
-      const keySet = new Set();
-      products.forEach(p => {
-        if (p.metafields?.edges) {
-          p.metafields.edges.forEach(e => keySet.add(`${e.node.namespace}.${e.node.key}`));
+      var keySet = {};
+      products.forEach(function(p) {
+        if (p.metafields && p.metafields.edges) {
+          p.metafields.edges.forEach(function(e) {
+            keySet[e.node.namespace + '.' + e.node.key] = true;
+          });
         }
       });
-      metafieldKeys = Array.from(keySet).sort();
+      allMetafieldKeys = Object.keys(keySet).sort();
     }
-    metafieldKeys.forEach(key => headers.push(`MF: ${key}`));
+    
+    // Split into category vs regular
+    allMetafieldKeys.forEach(function(key) {
+      if (isCategoryMetafield_(key)) {
+        categoryMetafieldKeys.push(key);
+      } else {
+        regularMetafieldKeys.push(key);
+      }
+    });
+    
+    // Add CAT: columns first (human-readable category metafields)
+    categoryMetafieldKeys.forEach(function(key) {
+      headers.push(categoryMetafieldColumnName_(key, taxRef));
+    });
+    
+    // Then regular MF: columns
+    regularMetafieldKeys.forEach(function(key) {
+      headers.push('MF: ' + key);
+    });
   }
   
   if (fields.variants) headers.push('Variant Count', 'Variants (JSON)');
   
   // Build rows
-  const rows = products.map(product => {
-    const row = [product.id, product.handle];
+  var rows = products.map(function(product) {
+    var row = [product.id, product.handle];
     
     if (fields.sku) {
-      const skus = product.variants?.edges?.map(v => v.node.sku).filter(s => s) || [];
+      var skus = product.variants && product.variants.edges 
+        ? product.variants.edges.map(function(v) { return v.node.sku; }).filter(function(s) { return s; })
+        : [];
       row.push(skus.join(', '));
     }
     if (fields.title) row.push(product.title || '');
@@ -480,36 +510,62 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
     if (fields.status) row.push(product.status || '');
     if (fields.tags) row.push((product.tags || []).join(', '));
     if (fields.category) {
-      row.push(product.category?.id || '', product.category?.name || '', product.category?.fullName || '');
+      row.push(
+        product.category ? product.category.id || '' : '',
+        product.category ? product.category.name || '' : '',
+        product.category ? product.category.fullName || '' : ''
+      );
     }
     if (fields.vendor) row.push(product.vendor || '');
     if (fields.descriptionHtml) row.push(product.descriptionHtml || '');
     if (fields.seo) {
-      row.push(product.seo?.title || '', product.seo?.description || '');
+      row.push(
+        product.seo ? product.seo.title || '' : '',
+        product.seo ? product.seo.description || '' : ''
+      );
     }
     if (fields.images) {
-      const imgs = product.images?.edges || [];
-      row.push(imgs[0]?.node?.url || '', imgs[1]?.node?.url || '', imgs[2]?.node?.url || '');
+      var imgs = product.images && product.images.edges ? product.images.edges : [];
+      row.push(
+        imgs[0] ? imgs[0].node.url || '' : '',
+        imgs[1] ? imgs[1].node.url || '' : '',
+        imgs[2] ? imgs[2].node.url || '' : ''
+      );
     }
+    
     if (fields.metafields) {
-      const mfMap = {};
-      if (product.metafields?.edges) {
-        product.metafields.edges.forEach(e => {
-          mfMap[`${e.node.namespace}.${e.node.key}`] = e.node.value;
+      // Build metafield lookup for this product
+      var mfMap = {};
+      if (product.metafields && product.metafields.edges) {
+        product.metafields.edges.forEach(function(e) {
+          mfMap[e.node.namespace + '.' + e.node.key] = e.node.value;
         });
       }
-      metafieldKeys.forEach(key => row.push(mfMap[key] || ''));
+      
+      // CAT: columns — translate GIDs to display names
+      categoryMetafieldKeys.forEach(function(key) {
+        var rawValue = mfMap[key] || '';
+        row.push(resolveMetaobjectGids_(rawValue, gidToDisplayName));
+      });
+      
+      // MF: columns — keep as-is (no translation)
+      regularMetafieldKeys.forEach(function(key) {
+        row.push(mfMap[key] || '');
+      });
     }
+    
     if (fields.variants) {
-      const vars = product.variants?.edges || [];
-      row.push(vars.length, JSON.stringify(vars.map(v => v.node)));
+      var vars = product.variants && product.variants.edges ? product.variants.edges : [];
+      row.push(vars.length, JSON.stringify(vars.map(function(v) { return v.node; })));
     }
     
     return row;
   });
   
-  // Write
+  // Write headers
   dataSheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e8e8e8');
+  
+  // Write data
   if (rows.length > 0) {
     dataSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
   }
@@ -519,25 +575,29 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
   dataSheet.getRange(1, headers.length + 3).setValue(new Date());
   
   // Auto-resize columns (first 10)
-  for (let i = 1; i <= Math.min(headers.length, 10); i++) {
+  for (var i = 1; i <= Math.min(headers.length, 10); i++) {
     dataSheet.autoResizeColumn(i);
   }
   dataSheet.setFrozenRows(1);
   
-  // PROTECT the sheet — read only for everyone except owner
-  const protection = dataSheet.protect().setDescription('Auto-locked after pull. Do not edit — use Push tab.');
-  // Remove all editors except the owner
-  const me = Session.getEffectiveUser();
+  // Color the CAT: column headers differently so they stand out
+  for (var c = 1; c <= headers.length; c++) {
+    if (headers[c - 1].toString().indexOf('CAT: ') === 0) {
+      dataSheet.getRange(1, c).setBackground('#d9ead3');  // light green
+    }
+  }
+  
+  // Protect the sheet
+  var protection = dataSheet.protect().setDescription('Auto-locked after pull. Do not edit — use Push tab.');
+  var me = Session.getEffectiveUser();
   protection.addEditor(me);
   try {
     protection.removeEditors(protection.getEditors());
     protection.addEditor(me);
   } catch (e) {
-    // If we can't manage editors, at least set a warning
     protection.setWarningOnly(true);
   }
 }
-
 // ── LOGGING ─────────────────────────────────────────────────
 
 function logAction_(ss, action, details, status) {
@@ -2087,3 +2147,178 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
   // Set sheet tab color to distinguish it
   sheet.setTabColor('#9fc5e8');
 }
+// SECTION A: NEW HELPER FUNCTIONS — paste at bottom of script
+// ============================================================
+ 
+ 
+// ── LOAD TAXONOMY REFERENCE INTO MEMORY ─────────────────────
+// Reads the "Taxonomy Reference" sheet and builds lookup maps.
+// Returns null if the sheet doesn't exist (just means you haven't
+// run Build Taxonomy Reference yet).
+//
+// Returns: {
+//   gidToDisplayName: { "gid://shopify/Metaobject/123": "V-neck", ... },
+//   displayNameToGid: { "shopify--neckline": { "V-neck": "gid://...", ... }, ... },
+//   metaobjectTypeToAttributeName: { "shopify--neckline": "Neckline", ... },
+//   categoryAttributes: { "gid://shopify/TaxonomyCategory/aa-1-4": ["Color", "Neckline", ...], ... }
+// }
+ 
+function loadTaxonomyReference_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('Taxonomy Reference');
+  
+  if (!sheet) return null;
+  
+  var data = sheet.getDataRange().getValues();
+  
+  var gidToDisplayName = {};
+  var displayNameToGid = {};  // grouped by metaobject type
+  var metaobjectTypeToAttributeName = {};
+  var categoryAttributes = {};
+  
+  var inSection1 = false;
+  var inSection2 = false;
+  
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    
+    // Detect section boundaries
+    if (row[0] && row[0].toString().indexOf('SECTION 1') !== -1) {
+      inSection1 = true;
+      inSection2 = false;
+      continue;
+    }
+    if (row[0] && row[0].toString().indexOf('SECTION 2') !== -1) {
+      inSection1 = false;
+      inSection2 = true;
+      continue;
+    }
+    
+    // Skip header rows
+    if (row[0] === 'Category ID' || row[0] === 'Metaobject Type') continue;
+    // Skip description rows
+    if (row[0] && row[0].toString().indexOf('Shows which') !== -1) continue;
+    if (row[0] && row[0].toString().indexOf('These are the') !== -1) continue;
+    
+    if (inSection1) {
+      // Section 1: Category ID | Category Name | Full Path | Products | Attribute Name | Attribute ID | Type | Value Count
+      var catId = row[0] ? row[0].toString().trim() : '';
+      var attrName = row[4] ? row[4].toString().trim() : '';
+      
+      if (catId && attrName && attrName !== '(no attributes)') {
+        if (!categoryAttributes[catId]) categoryAttributes[catId] = [];
+        categoryAttributes[catId].push(attrName);
+      }
+    }
+    
+    if (inSection2) {
+      // Section 2: Metaobject Type | Attribute Name | Display Name | Metaobject GID | Handle
+      var moType = row[0] ? row[0].toString().trim() : '';
+      var attrDisplayName = row[1] ? row[1].toString().trim() : '';
+      var valueName = row[2] ? row[2].toString().trim() : '';
+      var gid = row[3] ? row[3].toString().trim() : '';
+      var handle = row[4] ? row[4].toString().trim() : '';
+      
+      if (gid && valueName) {
+        // GID → Display Name (for pulling: converting GIDs to names)
+        gidToDisplayName[gid] = valueName;
+        
+        // Metaobject type → Attribute name mapping
+        if (moType && attrDisplayName) {
+          metaobjectTypeToAttributeName[moType] = attrDisplayName;
+        }
+        
+        // Display Name → GID grouped by type (for pushing: converting names back to GIDs)
+        // Only store the FIRST occurrence (original, not duplicates like casual-1)
+        if (moType) {
+          if (!displayNameToGid[moType]) displayNameToGid[moType] = {};
+          // Only store if we don't have this display name yet (skip duplicates)
+          if (!displayNameToGid[moType][valueName]) {
+            displayNameToGid[moType][valueName] = gid;
+          }
+        }
+      }
+    }
+  }
+  
+  return {
+    gidToDisplayName: gidToDisplayName,
+    displayNameToGid: displayNameToGid,
+    metaobjectTypeToAttributeName: metaobjectTypeToAttributeName,
+    categoryAttributes: categoryAttributes
+  };
+}
+ 
+ 
+// ── CHECK IF A METAFIELD IS A CATEGORY METAFIELD ────────────
+// Category metafields live under the "shopify" namespace.
+// e.g. "shopify.fabric", "shopify.neckline", "shopify.color-pattern"
+ 
+function isCategoryMetafield_(namespaceKey) {
+  return namespaceKey.indexOf('shopify.') === 0;
+}
+ 
+ 
+// ── RESOLVE A METAFIELD VALUE (JSON GID ARRAY) TO NAMES ─────
+// Category metafields store values as JSON arrays of Metaobject GIDs:
+//   ["gid://shopify/Metaobject/123", "gid://shopify/Metaobject/456"]
+// This function converts that to "V-neck, Round" using the reference.
+ 
+function resolveMetaobjectGids_(rawValue, gidToDisplayName) {
+  if (!rawValue) return '';
+  
+  var value = rawValue.toString().trim();
+  
+  // Try to parse as JSON array
+  try {
+    var gids = JSON.parse(value);
+    if (Array.isArray(gids)) {
+      var names = [];
+      for (var i = 0; i < gids.length; i++) {
+        var gid = gids[i].toString().trim();
+        var name = gidToDisplayName[gid];
+        if (name) {
+          names.push(name);
+        } else {
+          // GID not found in reference — keep the raw GID so we don't lose data
+          names.push(gid);
+        }
+      }
+      return names.join(', ');
+    }
+  } catch (e) {
+    // Not valid JSON — might be a single GID or already a display name
+  }
+  
+  // Check if it's a single GID (not wrapped in array)
+  if (value.indexOf('gid://shopify/Metaobject/') === 0) {
+    return gidToDisplayName[value] || value;
+  }
+  
+  // Already a display name or something else — return as-is
+  return value;
+}
+ 
+ 
+// ── MAP SHOPIFY NAMESPACE.KEY TO A FRIENDLY COLUMN NAME ─────
+// Converts "shopify.neckline" → "CAT: Neckline"
+// Converts "shopify.color-pattern" → "CAT: Color"
+// Uses the Taxonomy Reference to find the proper attribute name.
+// Falls back to title-casing the key if reference isn't available.
+ 
+function categoryMetafieldColumnName_(namespaceKey, taxRef) {
+  var key = namespaceKey.replace('shopify.', '');
+  var moType = 'shopify--' + key;
+  
+  // Try to find the friendly name from the reference
+  if (taxRef && taxRef.metaobjectTypeToAttributeName[moType]) {
+    return 'CAT: ' + taxRef.metaobjectTypeToAttributeName[moType];
+  }
+  
+  // Fallback: title-case the key
+  var friendly = key.replace(/-/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+  return 'CAT: ' + friendly;
+}
+ 
+ 
+// ============================================================
