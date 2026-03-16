@@ -98,6 +98,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🔍 List Metafield Definitions', 'listMetafieldDefinitions')
     .addItem('🏷️ Build Taxonomy Reference', 'buildTaxonomyReference')
+    .addItem('🔽 Add Dropdowns to Push Tab', 'addPushDropdowns')
     .addToUi();
 }
 
@@ -2432,3 +2433,111 @@ function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
  
  
 // ============================================================
+// ============================================================
+// PHASE 4 — DROPDOWN VALIDATION FOR CATEGORY METAFIELDS
+// ============================================================
+//
+// WHAT THIS DOES:
+// Adds dropdown lists to CAT: columns in the Push tab.
+// So when you click a cell under "CAT: Neckline", you get a
+// dropdown with "Asymmetric, Halter, Round, Square, V-neck"
+// instead of having to type it manually.
+//
+// HOW TO INSTALL:
+// 1. Add the new menu item to your onOpen() function (see below)
+// 2. Paste the functions (Section A) at the bottom of your script
+//
+// HOW TO USE:
+// 1. Pull products (so Data tab exists)
+// 2. Copy rows to Push tab
+// 3. Click 🛍️ Shopify → 🔽 Add Dropdowns to Push Tab
+//    (or it runs automatically from the Push Panel)
+// ============================================================
+
+
+// ── UPDATE YOUR onOpen() ────────────────────────────────────
+// Add this line to your menu, after the Build Taxonomy Reference item:
+//
+//   .addItem('🔽 Add Dropdowns to Push Tab', 'addPushDropdowns')
+//
+// So it looks like:
+//   .addItem('🏷️ Build Taxonomy Reference', 'buildTaxonomyReference')
+//   .addItem('🔽 Add Dropdowns to Push Tab', 'addPushDropdowns')
+//   .addToUi();
+
+
+// ============================================================
+// SECTION A: NEW FUNCTIONS — paste at bottom of script
+// ============================================================
+
+
+// ── MAIN FUNCTION: ADD DROPDOWNS TO PUSH TAB ────────────────
+// Scans the Push tab for CAT: columns, looks up allowed values
+// from the Taxonomy Reference sheet, and applies data validation.
+
+function addPushDropdowns() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var pushSheet = ss.getSheetByName('Push');
+  
+  if (!pushSheet) {
+    SpreadsheetApp.getUi().alert('No Push tab found. Copy rows from the Data tab first.');
+    return;
+  }
+  
+  var taxRef = loadTaxonomyReference_();
+  if (!taxRef) {
+    SpreadsheetApp.getUi().alert('No Taxonomy Reference sheet found. Run "Build Taxonomy Reference" first.');
+    return;
+  }
+  
+  var headers = pushSheet.getRange(1, 1, 1, pushSheet.getLastColumn()).getValues()[0];
+  var lastRow = pushSheet.getLastRow();
+  
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert('Push tab has no data rows. Copy some rows from the Data tab first.');
+    return;
+  }
+  
+  var dropdownCount = 0;
+  
+  for (var col = 0; col < headers.length; col++) {
+    var header = headers[col] ? headers[col].toString().trim() : '';
+    
+    if (header.indexOf('CAT: ') !== 0) continue;
+    
+    // Find the metaobject type for this column
+    var catInfo = catColumnToMetafieldKey_(header, taxRef);
+    if (!catInfo) continue;
+    
+    // Get allowed values from the reference
+    var lookupTable = taxRef.displayNameToGid[catInfo.moType];
+    if (!lookupTable) continue;
+    
+    var allowedValues = Object.keys(lookupTable).sort();
+    if (allowedValues.length === 0) continue;
+    
+    // Apply data validation to all data rows in this column
+    var range = pushSheet.getRange(2, col + 1, lastRow - 1, 1);
+    
+    var rule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(allowedValues, true)  // true = show dropdown
+      .setAllowInvalid(false)  // reject values not in the list
+      .setHelpText('Pick from: ' + allowedValues.join(', '))
+      .build();
+    
+    range.setDataValidation(rule);
+    dropdownCount++;
+  }
+  
+  if (dropdownCount > 0) {
+    SpreadsheetApp.getUi().alert(
+      '✅ Added dropdowns to ' + dropdownCount + ' CAT: column(s) in the Push tab.\n\n' +
+      'Click any cell in a CAT: column to see the dropdown.'
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      'No CAT: columns found in the Push tab.\n' +
+      'Make sure you pulled with metafields enabled and copied those columns to Push.'
+    );
+  }
+}
