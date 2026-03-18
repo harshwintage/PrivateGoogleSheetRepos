@@ -1,0 +1,407 @@
+// ============================================================
+// GOOGLE APPS SCRIPT — Push Bills from Google Sheets to Zoho Books
+// ============================================================
+// SETUP:
+// 1. Extensions → Apps Script → paste this
+// 2. Project Settings → Script Properties → add:
+//      ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_GRANT_TOKEN, ZOHO_ORG_ID
+//      ZOHO_TDS_TAX_ID  (e.g. 2566798000000031043)
+// 3. Zoho → Setup: Exchange Grant Token (one-time)
+// 4. Start pushing bills.
+//
+// STRUCTURE:
+//   Same Bill Number across rows = one bill, multiple line items.
+//   TDS is transaction-level. Any non-empty TDS Name in a bill group
+//   triggers TDS using ZOHO_TDS_TAX_ID from Script Properties.
+// ============================================================
+
+const SHEET_NAME     = "Bills";
+const DATA_START_ROW = 2;
+
+const ZOHO_ACCOUNTS_URL = "https://accounts.zoho.in";
+const ZOHO_BOOKS_URL    = "https://www.zohoapis.in";
+
+const COL = {
+  BILL_DATE:    1,   // A
+  VENDOR_NAME:  2,   // B
+  ACCOUNT:      3,   // C
+  BILL_NUMBER:  4,   // D
+  QUANTITY:     5,   // E
+  RATE:         6,   // F
+  TAX_NAME:     7,   // G  — just the number: 18, 5, 12, 28, 0
+  TDS_NAME:     8,   // H
+  FILE_LINK:    9,   // I
+  STATUS:       10,  // J  (auto)
+  ZOHO_BILL_ID: 11,  // K  (auto)
+  PUSHED_AT:    12,  // L  (auto)
+};
+
+// ===================== HELPERS =====================
+
+function getProps() { return PropertiesService.getScriptProperties(); }
+
+function prop(key) {
+  const val = getProps().getProperty(key);
+  if (!val) throw new Error("Missing Script Property: " + key);
+  return val;
+}
+
+// ===================== MENU =====================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Zoho")
+    .addItem("Push Selected Rows", "pushSelectedRows")
+    .addItem("Push ALL Unpushed Rows", "pushAllUnpushedRows")
+    .addSeparator()
+    .addItem("Setup: Exchange Grant Token (one-time)", "exchangeGrantToken")
+    .addItem("Setup: Create Sheet Headers", "setupSheet")
+    .addToUi();
+}
+
+// ===================== AUTH =====================
+
+function exchangeGrantToken() {
+  const ui = SpreadsheetApp.getUi();
+  const res = UrlFetchApp.fetch(ZOHO_ACCOUNTS_URL + "/oauth/v2/token", {
+    method: "post",
+    payload: {
+      grant_type: "authorization_code",
+      client_id: prop("ZOHO_CLIENT_ID"),
+      client_secret: prop("ZOHO_CLIENT_SECRET"),
+      code: prop("ZOHO_GRANT_TOKEN"),
+    },
+    muteHttpExceptions: true,
+  });
+  const data = JSON.parse(res.getContentText());
+  if (data.refresh_token) {
+    getProps().setProperty("ZOHO_REFRESH_TOKEN", data.refresh_token);
+    getProps().setProperty("ZOHO_ACCESS_TOKEN", data.access_token);
+    ui.alert("Done. Refresh token saved. You can delete ZOHO_GRANT_TOKEN now.");
+  } else {
+    ui.alert("Failed:\n" + res.getContentText());
+  }
+}
+
+function getAccessToken() {
+  const refreshToken = getProps().getProperty("ZOHO_REFRESH_TOKEN");
+  if (!refreshToken) throw new Error("No refresh token. Run Setup: Exchange Grant Token.");
+
+  const res = UrlFetchApp.fetch(ZOHO_ACCOUNTS_URL + "/oauth/v2/token", {
+    method: "post",
+    payload: {
+      grant_type: "refresh_token",
+      client_id: prop("ZOHO_CLIENT_ID"),
+      client_secret: prop("ZOHO_CLIENT_SECRET"),
+      refresh_token: refreshToken,
+    },
+    muteHttpExceptions: true,
+  });
+  const data = JSON.parse(res.getContentText());
+  if (!data.access_token) throw new Error("Token refresh failed: " + res.getContentText());
+  getProps().setProperty("ZOHO_ACCESS_TOKEN", data.access_token);
+  return data.access_token;
+}
+
+// ===================== ZOHO API =====================
+
+function zohoGet(endpoint, token) {
+  const sep = endpoint.includes("?") ? "&" : "?";
+  const res = UrlFetchApp.fetch(
+    ZOHO_BOOKS_URL + "/books/v3" + endpoint + sep + "organization_id=" + prop("ZOHO_ORG_ID"),
+    { method: "get", headers: { "Authorization": "Zoho-oauthtoken " + token }, muteHttpExceptions: true }
+  );
+  return JSON.parse(res.getContentText());
+}
+
+function zohoPost(endpoint, payload, token) {
+  const res = UrlFetchApp.fetch(
+    ZOHO_BOOKS_URL + "/books/v3" + endpoint + "?organization_id=" + prop("ZOHO_ORG_ID"),
+    {
+      method: "post",
+      headers: { "Authorization": "Zoho-oauthtoken " + token, "Content-Type": "application/json" },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    }
+  );
+  return JSON.parse(res.getContentText());
+}
+
+// ===================== LOOKUPS (cached per run) =====================
+
+let _accounts = null;
+let _taxes = null;
+
+function getAccountId(token, name) {
+  if (!_accounts) _accounts = (zohoGet("/chartofaccounts", token).chartofaccounts || []);
+  const match = _accounts.find(a => a.account_name === name);
+  if (!match) throw new Error("Account not found: '" + name + "'");
+  return match.account_id;
+}
+
+function getTaxId(token, name) {
+  if (!_taxes) _taxes = (zohoGet("/settings/taxes", token).taxes || []);
+  const match = _taxes.find(t => t.tax_name === name);
+  return match ? match.tax_id : null;
+}
+
+let _vendorCache = {};
+
+function getVendor(token, name) {
+  if (_vendorCache[name]) return _vendorCache[name];
+  const data = zohoGet("/contacts?contact_type=vendor&contact_name=" + encodeURIComponent(name), token);
+  if (!data.contacts || data.contacts.length === 0) return null;
+
+  const contact = data.contacts[0];
+  // Fetch full contact to get state
+  const detail = zohoGet("/contacts/" + contact.contact_id, token);
+  const fullContact = detail.contact || contact;
+
+  const state = (fullContact.place_of_contact || fullContact.gst_treatment_state || "").trim();
+
+  _vendorCache[name] = {
+    vendor_id: fullContact.contact_id,
+    state: state,
+  };
+  return _vendorCache[name];
+}
+
+// Org state — UP (Uttar Pradesh). Change if your org moves.
+const ORG_STATE = "UP";
+
+function resolveTaxName(taxRate, vendorState) {
+  const rate = parseInt(taxRate);
+  if (isNaN(rate)) return null;
+
+  const isSameState = vendorState && vendorState.toUpperCase() === ORG_STATE;
+  const prefix = isSameState ? "GST" : "IGST";
+  return prefix + rate; // e.g. "GST18" or "IGST18"
+}
+
+// ===================== BILL BUILDING =====================
+
+function buildLineItem(row, token, vendorState) {
+  const rateStr = String(row[COL.RATE - 1]).replace(/,/g, "");
+  const rate = parseFloat(rateStr);
+  if (isNaN(rate)) throw new Error("Invalid rate: " + row[COL.RATE - 1]);
+
+  const accountName = String(row[COL.ACCOUNT - 1]).trim();
+  const lineItem = {
+    account_id:  getAccountId(token, accountName),
+    description: accountName,
+    rate:        rate,
+    quantity:    parseFloat(row[COL.QUANTITY - 1]) || 1,
+  };
+
+  // Tax — user enters just the rate (e.g. 18), script picks GST18 or IGST18
+  const taxRate = String(row[COL.TAX_NAME - 1] ?? "").trim();
+  if (taxRate !== "") {
+    const taxName = resolveTaxName(taxRate, vendorState);
+    if (taxName) {
+      const taxId = getTaxId(token, taxName);
+      if (taxId) lineItem.tax_id = taxId;
+      else throw new Error("Tax '" + taxName + "' not found in Zoho. Check your tax settings.");
+    }
+  }
+
+  return lineItem;
+}
+
+function buildBill(group, token) {
+  const first = group[0].data;
+
+  const vendorName = String(first[COL.VENDOR_NAME - 1]).trim();
+  const vendor = getVendor(token, vendorName);
+  if (!vendor) throw new Error("Vendor not found: '" + vendorName + "'");
+
+  let billDate = first[COL.BILL_DATE - 1];
+  if (billDate instanceof Date) {
+    billDate = Utilities.formatDate(billDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  } else {
+    // Parse text dates — try creating a Date object from whatever was typed
+    const parsed = new Date(billDate);
+    if (!isNaN(parsed.getTime())) {
+      billDate = Utilities.formatDate(parsed, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    } else {
+      throw new Error("Can't parse date: '" + billDate + "'. Use any standard format like 17-Mar-2026 or 2026-03-17.");
+    }
+  }
+
+  const lineItems = group.map(entry => buildLineItem(entry.data, token, vendor.state));
+
+  // TDS — transaction level. Check if any row has TDS Name filled.
+  let hasTds = false;
+  for (const entry of group) {
+    if (String(entry.data[COL.TDS_NAME - 1] || "").trim()) { hasTds = true; break; }
+  }
+
+  const bill = {
+    vendor_id:      vendor.vendor_id,
+    bill_number:    String(first[COL.BILL_NUMBER - 1]).trim(),
+    date:           String(billDate),
+    is_tds_applied: hasTds,
+    line_items:     lineItems,
+  };
+
+  if (hasTds) {
+    bill.tds_tax_id = prop("ZOHO_TDS_TAX_ID");
+  }
+
+  // File links
+  const links = group
+    .map(e => String(e.data[COL.FILE_LINK - 1] || "").trim())
+    .filter(l => l);
+  if (links.length) bill.notes = "Attachments:\n" + links.join("\n");
+
+  return bill;
+}
+
+// ===================== ROW LOCKING =====================
+
+function lockRow(sheet, row) {
+  const range = sheet.getRange(row, 1, 1, Math.max(sheet.getLastColumn(), COL.PUSHED_AT));
+  range.setBackground("#f0f0f0");
+  range.setFontColor("#666666");
+
+  // Clear existing protections on this row
+  for (const p of sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE)) {
+    const r = p.getRange();
+    if (r.getRow() === row && r.getNumRows() === 1) p.remove();
+  }
+
+  const protection = range.protect().setDescription("Pushed — Row " + row);
+  const me = Session.getEffectiveUser();
+  protection.addEditor(me);
+  protection.removeEditors(protection.getEditors());
+  if (protection.canDomainEdit()) protection.setDomainEdit(false);
+}
+
+// ===================== GROUPING =====================
+
+function groupRows(sheet, startRow, endRow) {
+  const groups = {};
+  const order = [];
+
+  for (let r = startRow; r <= endRow; r++) {
+    if (sheet.getRange(r, COL.STATUS).getValue() === "Pushed") continue;
+    const bn = String(sheet.getRange(r, COL.BILL_NUMBER).getValue()).trim();
+    if (!bn) continue;
+
+    const data = sheet.getRange(r, 1, 1, COL.FILE_LINK).getValues()[0];
+    if (!groups[bn]) { groups[bn] = []; order.push(bn); }
+    groups[bn].push({ row: r, data: data });
+  }
+
+  return { groups, order };
+}
+
+// ===================== PUSH =====================
+
+function pushSelectedRows() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { ui.alert("Sheet '" + SHEET_NAME + "' not found."); return; }
+
+  const sel = sheet.getActiveRange();
+  const startRow = Math.max(sel.getRow(), DATA_START_ROW);
+  const endRow = sel.getRow() + sel.getNumRows() - 1;
+  if (startRow > endRow) { ui.alert("No data rows selected."); return; }
+
+  if (ui.alert("Push rows " + startRow + "–" + endRow + "?", ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  pushRows(sheet, startRow, endRow);
+}
+
+function pushAllUnpushedRows() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { ui.alert("Sheet '" + SHEET_NAME + "' not found."); return; }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < DATA_START_ROW) { ui.alert("No data."); return; }
+
+  if (ui.alert("Push all unpushed rows?", ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  pushRows(sheet, DATA_START_ROW, lastRow);
+}
+
+function pushRows(sheet, startRow, endRow) {
+  const ui = SpreadsheetApp.getUi();
+  let token;
+  try { token = getAccessToken(); } catch (e) { ui.alert("Auth Error:\n" + e.message); return; }
+
+  _accounts = null;
+  _taxes = null;
+  _vendorCache = {};
+
+  const { groups, order } = groupRows(sheet, startRow, endRow);
+  if (!order.length) { ui.alert("No unpushed rows found."); return; }
+
+  let ok = 0, fail = 0;
+  const errors = [];
+
+  for (const bn of order) {
+    const group = groups[bn];
+    const rows = group.map(e => e.row);
+
+    try {
+      const payload = buildBill(group, token);
+      const result = zohoPost("/bills", payload, token);
+
+      if (result.code !== 0 || !result.bill) {
+        throw new Error(result.message || JSON.stringify(result));
+      }
+
+      for (const e of group) {
+        sheet.getRange(e.row, COL.STATUS).setValue("Pushed");
+        sheet.getRange(e.row, COL.ZOHO_BILL_ID).setValue(result.bill.bill_id);
+        sheet.getRange(e.row, COL.PUSHED_AT).setValue(new Date());
+      }
+      SpreadsheetApp.flush();
+
+      for (const r of rows) {
+        try { lockRow(sheet, r); } catch (_) {}
+      }
+
+      ok++;
+    } catch (e) {
+      for (const entry of group) {
+        sheet.getRange(entry.row, COL.STATUS).setValue("Error: " + e.message);
+      }
+      fail++;
+      errors.push("Bill " + bn + " (rows " + rows.join(",") + "): " + e.message);
+    }
+
+    Utilities.sleep(500);
+  }
+
+  let msg = ok + " bill(s) pushed.";
+  if (fail) msg += "\n\n" + fail + " error(s):\n" + errors.join("\n");
+  ui.alert(msg);
+}
+
+// ===================== SHEET SETUP =====================
+
+function setupSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(SHEET_NAME);
+
+  const headers = [
+    "Bill Date", "Vendor Name", "Account", "Bill Number",
+    "Quantity", "Rate", "Tax %", "TDS Name", "File Link",
+    "Status", "Zoho Bill ID", "Pushed At",
+  ];
+
+  const hr = sheet.getRange(1, 1, 1, headers.length);
+  hr.setValues([headers]);
+  hr.setFontWeight("bold");
+  hr.setBackground("#1a1a2e");
+  hr.setFontColor("#ffffff");
+
+  sheet.getRange(1, COL.STATUS, 1, 3).setBackground("#4a0e4e");
+  sheet.setFrozenRows(1);
+
+  const w = { 1:110, 2:200, 3:250, 4:130, 6:100, 8:250, 9:300, 10:120, 11:160, 12:160 };
+  for (const [c, v] of Object.entries(w)) sheet.setColumnWidth(Number(c), v);
+
+  SpreadsheetApp.getUi().alert("Sheet ready.");
+}
