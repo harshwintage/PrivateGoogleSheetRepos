@@ -1,6 +1,6 @@
 // ============================================================
 // INDOPHILIA — SHOPIFY PRODUCT PULL ENGINE v2
-// Google Apps Script — Paste into Apps Script Editorrrr
+// Google Apps Script — Paste into Apps Script Editor
 // ============================================================
 // SETUP:
 // 1. Paste this code into Apps Script
@@ -126,13 +126,11 @@ function openPullPanel() {
 }
 
 // ── FETCH STORE METADATA (called from sidebar) ─────────────
-// Gets all unique product types, tags, vendors, statuses, and metafield keys
 
 function fetchStoreMetadata() {
   const token = getAccessToken_();
   const config = getConfig_();
   
-  // We'll scan products to build frequency maps
   const productTypes = {};
   const tags = {};
   const vendors = {};
@@ -182,29 +180,24 @@ function fetchStoreMetadata() {
       const p = edge.node;
       totalProducts++;
       
-      // Product type frequency
       if (p.productType) {
         productTypes[p.productType] = (productTypes[p.productType] || 0) + 1;
       }
       
-      // Tags frequency
       if (p.tags) {
         p.tags.forEach(tag => {
           tags[tag] = (tags[tag] || 0) + 1;
         });
       }
       
-      // Vendor frequency
       if (p.vendor) {
         vendors[p.vendor] = (vendors[p.vendor] || 0) + 1;
       }
       
-      // Status count
       if (p.status) {
         statuses[p.status] = (statuses[p.status] || 0) + 1;
       }
       
-      // Metafield keys
       if (p.metafields?.edges) {
         p.metafields.edges.forEach(mf => {
           const key = `${mf.node.namespace}.${mf.node.key}`;
@@ -216,7 +209,6 @@ function fetchStoreMetadata() {
     Utilities.sleep(300);
   }
   
-  // Sort by frequency (most common first)
   const sortByFreq = (obj) => Object.entries(obj)
     .sort((a, b) => b[1] - a[1])
     .map(([name, count]) => ({ name, count }));
@@ -291,10 +283,6 @@ function fetchSampleProduct(productType) {
 // ── EXECUTE PULL (called from sidebar) ──────────────────────
 
 function executePull(options) {
-  // options = { filters: { productTypes: [], tags: [], vendors: [], statuses: [] },
-  //             fields: { title: true, handle: true, ... },
-  //             metafieldKeys: [] }
-  
   const token = getAccessToken_();
   const config = getConfig_();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -350,13 +338,13 @@ function executePull(options) {
   if (f.descriptionHtml) productFields += '\n    descriptionHtml';
   if (f.seo) productFields += '\n    seo { title description }';
   if (f.images) productFields += '\n    images(first: 10) { edges { node { url altText } } }';
-  // Variants / SKU — handle both fields needing variant data
-  const needsVariants = f.sku || f.variants;
+  
+  // Variants / SKU / Price — handle all fields needing variant data
+  const needsVariants = f.sku || f.variants || f.price;
   if (needsVariants) {
-    if (f.variants) {
+    if (f.variants || f.price) {
       productFields += '\n    variants(first: 100) { edges { node { id title sku price inventoryQuantity } } }';
     } else {
-      // Only need SKU
       productFields += '\n    variants(first: 100) { edges { node { sku } } }';
     }
   }
@@ -423,7 +411,6 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
   var dataSheet = ss.getSheetByName('Data');
   if (!dataSheet) dataSheet = ss.insertSheet('Data');
   
-  // Remove existing protection so we can write
   dataSheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(function(p) {
     if (p.canEdit()) p.remove();
   });
@@ -448,11 +435,15 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
   if (fields.tags) headers.push('Tags');
   if (fields.category) headers.push('Category ID', 'Category Name', 'Category Full Name');
   if (fields.vendor) headers.push('Vendor');
+  
+  // Price columns — Variant ID is needed for the push but is read-only
+  if (fields.price) headers.push('Variant ID', 'Price');
+  
   if (fields.descriptionHtml) headers.push('Description (HTML)');
   if (fields.seo) headers.push('SEO Title', 'SEO Description');
   if (fields.images) headers.push('Image 1', 'Image 2', 'Image 3');
   
-  // ── Separate metafield keys into CATEGORY (shopify.*) and REGULAR ──
+  // Separate metafield keys into category and regular
   var categoryMetafieldKeys = [];
   var regularMetafieldKeys = [];
   
@@ -462,7 +453,6 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
     if (selectedMetafieldKeys && selectedMetafieldKeys.length > 0) {
       allMetafieldKeys = selectedMetafieldKeys;
     } else {
-      // Discover all keys from data
       var keySet = {};
       products.forEach(function(p) {
         if (p.metafields && p.metafields.edges) {
@@ -474,7 +464,6 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
       allMetafieldKeys = Object.keys(keySet).sort();
     }
     
-    // Split into category vs regular
     allMetafieldKeys.forEach(function(key) {
       if (isCategoryMetafield_(key)) {
         categoryMetafieldKeys.push(key);
@@ -483,12 +472,10 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
       }
     });
     
-    // Add CAT: columns first (human-readable category metafields)
     categoryMetafieldKeys.forEach(function(key) {
       headers.push(categoryMetafieldColumnName_(key, taxRef));
     });
     
-    // Then regular MF: columns
     regularMetafieldKeys.forEach(function(key) {
       headers.push('MF: ' + key);
     });
@@ -518,6 +505,17 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
       );
     }
     if (fields.vendor) row.push(product.vendor || '');
+    
+    // Price — from first variant
+    if (fields.price) {
+      var firstVariant = product.variants && product.variants.edges && product.variants.edges[0] 
+        ? product.variants.edges[0].node : null;
+      row.push(
+        firstVariant ? firstVariant.id || '' : '',
+        firstVariant ? firstVariant.price || '' : ''
+      );
+    }
+    
     if (fields.descriptionHtml) row.push(product.descriptionHtml || '');
     if (fields.seo) {
       row.push(
@@ -535,7 +533,6 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
     }
     
     if (fields.metafields) {
-      // Build metafield lookup for this product
       var mfMap = {};
       if (product.metafields && product.metafields.edges) {
         product.metafields.edges.forEach(function(e) {
@@ -543,13 +540,11 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
         });
       }
       
-      // CAT: columns — translate GIDs to display names
       categoryMetafieldKeys.forEach(function(key) {
         var rawValue = mfMap[key] || '';
         row.push(resolveMetaobjectGids_(rawValue, gidToDisplayName));
       });
       
-      // MF: columns — keep as-is (no translation)
       regularMetafieldKeys.forEach(function(key) {
         row.push(mfMap[key] || '');
       });
@@ -566,29 +561,28 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
   // Write headers
   dataSheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e8e8e8');
   
-  // Write data
   if (rows.length > 0) {
     dataSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
   }
   
-  // Add pull timestamp
+  // Timestamp
   dataSheet.getRange(1, headers.length + 2).setValue('Pulled at:').setFontWeight('bold');
   dataSheet.getRange(1, headers.length + 3).setValue(new Date());
   
-  // Auto-resize columns (first 10)
+  // Auto-resize
   for (var i = 1; i <= Math.min(headers.length, 10); i++) {
     dataSheet.autoResizeColumn(i);
   }
   dataSheet.setFrozenRows(1);
   
-  // Color the CAT: column headers differently so they stand out
+  // Color CAT: headers green
   for (var c = 1; c <= headers.length; c++) {
     if (headers[c - 1].toString().indexOf('CAT: ') === 0) {
-      dataSheet.getRange(1, c).setBackground('#d9ead3');  // light green
+      dataSheet.getRange(1, c).setBackground('#d9ead3');
     }
   }
   
-  // Protect the sheet
+  // Protect
   var protection = dataSheet.protect().setDescription('Auto-locked after pull. Do not edit — use Push tab.');
   var me = Session.getEffectiveUser();
   protection.addEditor(me);
@@ -599,6 +593,7 @@ function writeToDataSheet_(ss, products, fields, selectedMetafieldKeys) {
     protection.setWarningOnly(true);
   }
 }
+
 // ── LOGGING ─────────────────────────────────────────────────
 
 function logAction_(ss, action, details, status) {
@@ -616,7 +611,7 @@ function logAction_(ss, action, details, status) {
 function pullAll() {
   const result = executePull({
     filters: { statuses: ['ACTIVE'], productTypes: [], tags: [], vendors: [] },
-    fields: { sku: true, title: true, productType: true, status: true, tags: true, vendor: true, category: true, images: true, metafields: true, variants: false, descriptionHtml: false, seo: false },
+    fields: { sku: true, title: true, productType: true, status: true, tags: true, vendor: true, category: true, images: true, metafields: true, price: true, variants: false, descriptionHtml: false, seo: false },
     metafieldKeys: []
   });
   SpreadsheetApp.getUi().alert(`✅ Pulled ${result.count} active products.`);
@@ -625,7 +620,7 @@ function pullAll() {
 function pullMetafieldsOnly() {
   const result = executePull({
     filters: { statuses: ['ACTIVE'], productTypes: [], tags: [], vendors: [] },
-    fields: { sku: true, title: true, productType: false, status: false, tags: false, vendor: false, category: false, images: false, metafields: true, variants: false, descriptionHtml: false, seo: false },
+    fields: { sku: true, title: true, productType: false, status: false, tags: false, vendor: false, category: false, images: false, metafields: true, price: false, variants: false, descriptionHtml: false, seo: false },
     metafieldKeys: []
   });
   SpreadsheetApp.getUi().alert(`✅ Pulled ${result.count} products (metafields only).`);
@@ -678,7 +673,6 @@ function openPushPanel() {
 }
 
 // ── ANALYZE PUSH TAB (called from push sidebar) ─────────────
-// Compares Push tab to Data tab and finds differences
 
 function analyzePushChanges() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -703,7 +697,6 @@ function analyzePushChanges() {
   var dataIdCol = dataHeaders.indexOf('Product ID');
   if (dataIdCol === -1) throw new Error('Data tab is missing "Product ID" column.');
   
-  // Build lookup of Data tab by Product ID
   var dataLookup = {};
   for (var i = 1; i < dataData.length; i++) {
     var id = dataData[i][dataIdCol].toString().trim();
@@ -714,23 +707,19 @@ function analyzePushChanges() {
     }
   }
   
-  // Pushable fields — standard ones
+  // Pushable fields — includes Price
   var pushableFields = ['Title', 'Tags', 'Category ID', 'Vendor', 'Product Type', 
-    'Status', 'SEO Title', 'SEO Description', 'Description (HTML)'];
+    'Status', 'SEO Title', 'SEO Description', 'Description (HTML)', 'Price'];
   
-  // Also any MF: columns
   var mfColumns = pushHeaders.filter(function(h) { return h.indexOf('MF: ') === 0; });
-  
-  // Also any CAT: columns (NEW in Phase 3)
   var catColumns = pushHeaders.filter(function(h) { return h.indexOf('CAT: ') === 0; });
   
   var allPushable = pushableFields.concat(mfColumns).concat(catColumns);
   
-  // Read-only columns
-  var readOnlyFields = ['Product ID', 'Handle', 'SKU', 'Category Name', 'Category Full Name', 
-    'Image 1', 'Image 2', 'Image 3', 'Variant Count', 'Variants (JSON)'];
+  // Read-only — includes Variant ID
+  var readOnlyFields = ['Product ID', 'Handle', 'SKU', 'Variant ID', 'Category Name', 
+    'Category Full Name', 'Image 1', 'Image 2', 'Image 3', 'Variant Count', 'Variants (JSON)'];
   
-  // Compare each row
   var changes = [];
   
   for (var i = 1; i < pushData.length; i++) {
@@ -739,6 +728,11 @@ function analyzePushChanges() {
     
     var handle = pushData[i][pushHeaders.indexOf('Handle')] || '';
     var title = pushData[i][pushHeaders.indexOf('Title')] || '';
+    
+    // Grab Variant ID for price pushes
+    var variantIdCol = pushHeaders.indexOf('Variant ID');
+    var variantId = variantIdCol !== -1 ? (pushData[i][variantIdCol] || '').toString().trim() : '';
+    
     var dataRow = dataLookup[productId];
     
     var rowChanges = [];
@@ -762,6 +756,7 @@ function analyzePushChanges() {
     if (rowChanges.length > 0) {
       changes.push({
         productId: productId,
+        variantId: variantId,
         handle: handle.toString(),
         title: title.toString(),
         rowNum: i + 1,
@@ -770,7 +765,6 @@ function analyzePushChanges() {
     }
   }
   
-  // Get pull timestamp
   var pullTimestamp = dataSheet.getRange(1, dataHeaders.length + 3).getValue();
   
   return {
@@ -784,14 +778,8 @@ function analyzePushChanges() {
     ignoredEdits: []
   };
 }
- 
- 
-// ============================================================
 
 // ── EXECUTE PUSH (CHUNKED) ──────────────────────────────────
-// Processes in batches of 200 to stay within Apps Script's 6-min limit.
-// Uses ScriptProperties to track progress across runs.
-// Auto-chains via time-based triggers if more batches remain.
 
 var PUSH_BATCH_SIZE = 200;
 
@@ -807,7 +795,6 @@ function executePush(isDryRun) {
     return { success: true, message: 'Dry run complete.', dryRun: true, analysis: analysis };
   }
   
-  // Save all changes to ScriptProperties so chunked runs can access them
   const props = PropertiesService.getScriptProperties();
   props.setProperty('PUSH_CHANGES', JSON.stringify(analysis.changes));
   props.setProperty('PUSH_INDEX', '0');
@@ -815,55 +802,108 @@ function executePush(isDryRun) {
   props.setProperty('PUSH_TOTAL', analysis.changes.length.toString());
   props.setProperty('PUSH_RUNNING', 'true');
   
-  // Run the first batch
   const batchResult = executePushBatch_();
   
   return batchResult;
 }
 
 function executePushBatch_() {
-  const props = PropertiesService.getScriptProperties();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  var props = PropertiesService.getScriptProperties();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
   
-  const changes = JSON.parse(props.getProperty('PUSH_CHANGES') || '[]');
-  let startIndex = parseInt(props.getProperty('PUSH_INDEX') || '0');
-  let results = JSON.parse(props.getProperty('PUSH_RESULTS') || '[]');
-  const total = parseInt(props.getProperty('PUSH_TOTAL') || '0');
+  var changes = JSON.parse(props.getProperty('PUSH_CHANGES') || '[]');
+  var startIndex = parseInt(props.getProperty('PUSH_INDEX') || '0');
+  var results = JSON.parse(props.getProperty('PUSH_RESULTS') || '[]');
+  var total = parseInt(props.getProperty('PUSH_TOTAL') || '0');
   
   if (changes.length === 0 || startIndex >= changes.length) {
     finalizePush_();
     return { success: true, message: 'No more products to push.', results: results };
   }
   
-  const token = getAccessToken_();
-  const config = getConfig_();
+  var token = getAccessToken_();
+  var config = getConfig_();
   
-  const endIndex = Math.min(startIndex + PUSH_BATCH_SIZE, changes.length);
-  Logger.log(`📤 Push batch: products ${startIndex + 1} to ${endIndex} of ${changes.length}`);
+  var endIndex = Math.min(startIndex + PUSH_BATCH_SIZE, changes.length);
+  Logger.log('📤 Push batch: products ' + (startIndex + 1) + ' to ' + endIndex + ' of ' + changes.length);
   
-  for (let i = startIndex; i < endIndex; i++) {
-    const product = changes[i];
+  for (var i = startIndex; i < endIndex; i++) {
+    var product = changes[i];
     try {
-      const mutation = buildUpdateMutation_(product);
-      const result = shopifyGraphQL_(token, config.shopDomain, mutation.query, mutation.variables);
+      // Separate price changes from other changes
+      var priceChange = null;
+      var otherChanges = [];
       
-      const userErrors = result.data?.productUpdate?.userErrors || [];
+      product.changes.forEach(function(change) {
+        if (change.field === 'Price') {
+          priceChange = change;
+        } else {
+          otherChanges.push(change);
+        }
+      });
       
-      if (userErrors.length > 0) {
-        results.push({
+      var updateDetails = [];
+      
+      // Push non-price changes via productUpdate
+      if (otherChanges.length > 0) {
+        var productWithOtherChanges = {
           productId: product.productId,
           handle: product.handle,
-          status: '❌ Error',
-          details: userErrors.map(e => `${e.field}: ${e.message}`).join('; ')
-        });
-      } else {
-        results.push({
-          productId: product.productId,
-          handle: product.handle,
-          status: '✅ Updated',
-          details: product.changes.map(c => c.field).join(', ')
-        });
+          changes: otherChanges
+        };
+        
+        var mutation = buildUpdateMutation_(productWithOtherChanges);
+        var result = shopifyGraphQL_(token, config.shopDomain, mutation.query, mutation.variables);
+        
+        var userErrors = result.data && result.data.productUpdate ? result.data.productUpdate.userErrors || [] : [];
+        
+        if (userErrors.length > 0) {
+          results.push({
+            productId: product.productId,
+            handle: product.handle,
+            status: '❌ Error',
+            details: userErrors.map(function(e) { return e.field + ': ' + e.message; }).join('; ')
+          });
+          Utilities.sleep(500);
+          continue;
+        }
+        
+        updateDetails = otherChanges.map(function(c) { return c.field; });
       }
+      
+      // Push price change via productVariantsBulkUpdate
+      if (priceChange && product.variantId) {
+        var priceResult = pushVariantPrice_(token, config, product.productId, product.variantId, priceChange.newValue);
+        
+        if (priceResult.success) {
+          updateDetails.push('Price');
+        } else {
+          results.push({
+            productId: product.productId,
+            handle: product.handle,
+            status: '❌ Price Error',
+            details: priceResult.error
+          });
+          Utilities.sleep(500);
+          continue;
+        }
+      } else if (priceChange && !product.variantId) {
+        results.push({
+          productId: product.productId,
+          handle: product.handle,
+          status: '❌ Price Error',
+          details: 'No Variant ID found. Make sure "Variant ID" column is in the Push tab.'
+        });
+        Utilities.sleep(500);
+        continue;
+      }
+      
+      results.push({
+        productId: product.productId,
+        handle: product.handle,
+        status: '✅ Updated',
+        details: updateDetails.join(', ')
+      });
       
       Utilities.sleep(500);
       
@@ -881,45 +921,38 @@ function executePushBatch_() {
   props.setProperty('PUSH_INDEX', endIndex.toString());
   props.setProperty('PUSH_RESULTS', JSON.stringify(results));
   
-  // Check if more batches needed
   if (endIndex < changes.length) {
-    // Schedule next batch in 10 seconds via trigger
-    Logger.log(`⏳ ${changes.length - endIndex} products remaining. Scheduling next batch...`);
+    Logger.log('⏳ ' + (changes.length - endIndex) + ' products remaining. Scheduling next batch...');
     
-    // Clean up old triggers first
     cleanPushTriggers_();
     
-    // Create a new trigger to continue
     ScriptApp.newTrigger('continuePush')
       .timeBased()
-      .after(10 * 1000) // 10 seconds
+      .after(10 * 1000)
       .create();
     
-    // Write intermediate results
     writePushResults_(ss, results);
-    logAction_(ss, 'PUSH (batch)', `${endIndex} of ${changes.length} processed so far`, '🔄 In progress');
+    logAction_(ss, 'PUSH (batch)', endIndex + ' of ' + changes.length + ' processed so far', '🔄 In progress');
     
     return { 
       success: true, 
-      message: `Batch complete: ${endIndex} of ${changes.length} products processed. Next batch auto-scheduled.`,
+      message: 'Batch complete: ' + endIndex + ' of ' + changes.length + ' products processed. Next batch auto-scheduled.',
       results: results,
       inProgress: true,
       processed: endIndex,
       total: changes.length
     };
   } else {
-    // All done
     finalizePush_();
     return {
       success: true,
-      message: `Push complete. ${results.filter(r => r.status.includes('✅')).length} updated, ${results.filter(r => r.status.includes('❌')).length} failed.`,
+      message: 'Push complete. ' + results.filter(function(r) { return r.status.indexOf('✅') !== -1; }).length + ' updated, ' + results.filter(function(r) { return r.status.indexOf('❌') !== -1; }).length + ' failed.',
       results: results,
       inProgress: false
     };
   }
 }
 
-// Called automatically by the time trigger for subsequent batches
 function continuePush() {
   cleanPushTriggers_();
   
@@ -942,7 +975,6 @@ function finalizePush_() {
   
   writePushResults_(ss, results);
   
-  // Clean up
   props.deleteProperty('PUSH_CHANGES');
   props.deleteProperty('PUSH_INDEX');
   props.deleteProperty('PUSH_RESULTS');
@@ -962,7 +994,6 @@ function cleanPushTriggers_() {
   });
 }
 
-// Check push status (called from sidebar)
 function getPushStatus() {
   const props = PropertiesService.getScriptProperties();
   const running = props.getProperty('PUSH_RUNNING') === 'true';
@@ -973,7 +1004,6 @@ function getPushStatus() {
   return { running, processed: index, total, results };
 }
 
-// Cancel an in-progress push
 function cancelPush() {
   finalizePush_();
   return { success: true, message: 'Push cancelled.' };
@@ -981,9 +1011,7 @@ function cancelPush() {
 
 // ── BUILD UPDATE MUTATION ───────────────────────────────────
 
-  function buildUpdateMutation_(product) {
-  // Load taxonomy reference (cached per push batch would be better,
-  // but this is simple and works — the sheet read is fast)
+function buildUpdateMutation_(product) {
   var taxRef = loadTaxonomyReference_();
   
   var productInput = {
@@ -993,7 +1021,6 @@ function cancelPush() {
   var metafields = [];
   
   product.changes.forEach(function(change) {
-    // ── Standard fields ──
     if (change.field === 'Title') {
       productInput.title = change.newValue;
     }
@@ -1023,12 +1050,11 @@ function cancelPush() {
       if (!productInput.seo) productInput.seo = {};
       productInput.seo.description = change.newValue;
     }
-    // ── CAT: columns (category metafields) — NEW ──
+    // CAT: columns (category metafields)
     else if (change.field.indexOf('CAT: ') === 0) {
       var catInfo = catColumnToMetafieldKey_(change.field, taxRef);
       
       if (catInfo) {
-        // Convert display names to GID JSON array
         var gidJson = displayNamesToGidJson_(change.newValue, catInfo.moType, taxRef);
         
         metafields.push({
@@ -1039,18 +1065,27 @@ function cancelPush() {
         });
       }
     }
-    // ── MF: columns (regular metafields) ──
+    // MF: columns (regular metafields)
     else if (change.field.indexOf('MF: ') === 0) {
       var fullKey = change.field.replace('MF: ', '');
       var dotIndex = fullKey.indexOf('.');
       var namespace = fullKey.substring(0, dotIndex);
       var key = fullKey.substring(dotIndex + 1);
       
+      var mfType = 'single_line_text_field';
+      var mfValue = change.newValue;
+      
+      if (mfValue.indexOf('gid://shopify/Metaobject/') === 0) {
+        mfType = 'metaobject_reference';
+      } else if (mfValue.indexOf('["gid://shopify/Metaobject/') === 0) {
+        mfType = 'list.metaobject_reference';
+      }
+      
       metafields.push({
         namespace: namespace,
         key: key,
-        value: change.newValue,
-        type: 'single_line_text_field'
+        value: mfValue,
+        type: mfType
       });
     }
   });
@@ -1129,6 +1164,50 @@ function dryRunPush() {
     SpreadsheetApp.getUi().alert(msg);
   } catch (e) {
     SpreadsheetApp.getUi().alert('❌ ' + e.message);
+  }
+}
+
+// ── PUSH VARIANT PRICE ──────────────────────────────────────
+
+function pushVariantPrice_(token, config, productId, variantId, newPrice) {
+  var query = '\
+    mutation VariantPriceUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {\
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {\
+        productVariants {\
+          id\
+          price\
+        }\
+        userErrors {\
+          field\
+          message\
+        }\
+      }\
+    }\
+  ';
+  
+  var variables = {
+    productId: productId,
+    variants: [{
+      id: variantId,
+      price: newPrice.toString()
+    }]
+  };
+  
+  try {
+    var result = shopifyGraphQL_(token, config.shopDomain, query, variables);
+    var userErrors = result.data && result.data.productVariantsBulkUpdate 
+      ? result.data.productVariantsBulkUpdate.userErrors || [] : [];
+    
+    if (userErrors.length > 0) {
+      return { 
+        success: false, 
+        error: userErrors.map(function(e) { return e.field + ': ' + e.message; }).join('; ')
+      };
+    }
+    
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 }
 
@@ -1225,24 +1304,20 @@ function getPushSidebarHtml_() {
       return;
     }
     
-    // Calculate hours since pull
     const pullDate = new Date(data.pullTimestamp);
     const hoursSincePull = Math.round((new Date() - pullDate) / (1000 * 60 * 60));
     
     let html = '';
     
-    // Warning if data is stale
     if (hoursSincePull > 24) {
       html += '<div class="warning-box">⚠️ <strong>Stale data warning!</strong> Your Data tab was pulled ' + hoursSincePull + ' hours ago. Consider doing a fresh Pull before pushing.</div>';
     }
     
-    // Stats
     html += '<div class="stats">';
     html += '<div class="stat"><div class="stat-value">' + data.productsWithChanges + '</div><div class="stat-label">Products to update</div></div>';
     html += '<div class="stat"><div class="stat-value">' + data.totalChanges + '</div><div class="stat-label">Field changes</div></div>';
     html += '</div>';
     
-    // Show pushable vs read-only columns
     if (data.pushableColumns && data.pushableColumns.length > 0) {
       html += '<div style="font-size:11px; margin-bottom:12px; padding:8px; background:#f8f8f8; border-radius:6px;">';
       html += '<strong style="color:#339933;">✎ Pushable:</strong> ' + data.pushableColumns.join(', ');
@@ -1252,7 +1327,6 @@ function getPushSidebarHtml_() {
       html += '</div>';
     }
     
-    // Change list
     html += '<div class="change-list">';
     data.changes.forEach(function(product) {
       html += '<div class="change-item">';
@@ -1271,7 +1345,6 @@ function getPushSidebarHtml_() {
     });
     html += '</div>';
     
-    // Action buttons
     html += '<button class="btn btn-push" onclick="confirmAndPush()">📤 Push ' + data.productsWithChanges + ' Products to Shopify</button>';
     html += '<button class="btn btn-analyze" onclick="analyze()" style="margin-top:6px">🔄 Re-analyze</button>';
     
@@ -1305,26 +1378,21 @@ function getPushSidebarHtml_() {
     let html = '';
     
     if (result.inProgress) {
-      // Show progress and start polling
       html += '<div class="info-box">🔄 <strong>Push in progress...</strong><br>' + result.processed + ' of ' + result.total + ' products processed.<br>Next batch auto-scheduled. This panel will update automatically.</div>';
       
-      // Progress bar
       const pct = Math.round((result.processed / result.total) * 100);
       html += '<div style="background:#e8e8e8; border-radius:8px; height:24px; margin-bottom:16px; overflow:hidden;">';
       html += '<div style="background:#1a1a1a; height:100%; width:' + pct + '%; border-radius:8px; transition:width 0.5s; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:600;">' + pct + '%</div>';
       html += '</div>';
       
-      // Cancel button
       html += '<button class="btn btn-analyze" onclick="cancelPush()">⛔ Cancel Push</button>';
       
-      // Start polling for updates
       setTimeout(pollPushStatus, 15000);
       
       el.innerHTML = html;
       return;
     }
     
-    // Push is complete
     if (result.results) {
       const successes = result.results.filter(r => r.status.includes('✅'));
       const failures = result.results.filter(r => r.status.includes('❌'));
@@ -1335,7 +1403,6 @@ function getPushSidebarHtml_() {
         html += '<div class="warning-box">⚠️ <strong>' + successes.length + ' succeeded, ' + failures.length + ' failed.</strong><br>Check the "Push Results" tab for details.</div>';
       }
       
-      // Show results summary (limit to 20 to avoid huge sidebar)
       html += '<div class="change-list">';
       result.results.slice(0, 20).forEach(function(r) {
         html += '<div class="change-item">';
@@ -1359,12 +1426,10 @@ function getPushSidebarHtml_() {
     google.script.run
       .withSuccessHandler(function(status) {
         if (!status.running) {
-          // Push finished — show final results
           onPushComplete({ success: true, results: status.results, inProgress: false });
           return;
         }
         
-        // Update progress
         const el = document.getElementById('results');
         const pct = Math.round((status.processed / status.total) * 100);
         const successes = status.results.filter(function(r) { return r.status.includes('✅'); }).length;
@@ -1378,7 +1443,6 @@ function getPushSidebarHtml_() {
         
         el.innerHTML = html;
         
-        // Continue polling
         setTimeout(pollPushStatus, 15000);
       })
       .withFailureHandler(function() {
@@ -1479,20 +1543,12 @@ function getSidebarHtml_() {
       🔍 Filters <span class="arrow">▼</span>
     </div>
     <div class="section-body">
-      
-      <!-- Status -->
       <h3>Status</h3>
       <div id="statusFilters"></div>
-      
-      <!-- Product Type -->
       <h3>Product Type <span class="select-all" onclick="toggleAll('ptFilter')">toggle all</span></h3>
       <div id="productTypeFilters"></div>
-      
-      <!-- Vendor -->
       <h3>Vendor <span class="select-all" onclick="toggleAll('vendorFilter')">toggle all</span></h3>
       <div id="vendorFilters"></div>
-      
-      <!-- Tags -->
       <h3>Tags <span class="select-all" onclick="toggleAll('tagFilter')">toggle all</span></h3>
       <div id="tagFilters" style="max-height:150px; overflow-y:auto;"></div>
     </div>
@@ -1530,7 +1586,6 @@ function getSidebarHtml_() {
 <script>
   let storeData = null;
   
-  // ── INIT ──
   google.script.run
     .withSuccessHandler(onMetadataLoaded)
     .withFailureHandler(onError)
@@ -1541,22 +1596,11 @@ function getSidebarHtml_() {
     document.getElementById('loading').style.display = 'none';
     document.getElementById('main').style.display = 'block';
     
-    // Render status filters
     renderCheckboxes('statusFilters', data.statuses, 'statusFilter', true);
-    
-    // Render product type filters
     renderCheckboxes('productTypeFilters', data.productTypes, 'ptFilter', false);
-    
-    // Render vendor filters
     renderCheckboxes('vendorFilters', data.vendors, 'vendorFilter', false);
-    
-    // Render tag filters
     renderCheckboxes('tagFilters', data.tags, 'tagFilter', false);
-    
-    // Render field selectors
     renderFieldSelectors();
-    
-    // Render metafield selectors
     renderCheckboxes('metafieldSelectors', data.metafieldKeys, 'mfKey', true);
     
     document.getElementById('statusText').textContent = data.totalProducts + ' products in store';
@@ -1566,7 +1610,6 @@ function getSidebarHtml_() {
     document.getElementById('loading').innerHTML = '<p style="color:red">❌ ' + err.message + '</p>';
   }
   
-  // ── RENDER CHECKBOXES ──
   function renderCheckboxes(containerId, items, namePrefix, checkedByDefault) {
     const container = document.getElementById(containerId);
     if (!items || items.length === 0) {
@@ -1584,7 +1627,6 @@ function getSidebarHtml_() {
     }).join('');
   }
   
-  // ── FIELD SELECTORS ──
   function renderFieldSelectors() {
     const fields = [
       { key: 'sku', label: 'SKU', default: true },
@@ -1596,6 +1638,7 @@ function getSidebarHtml_() {
       { key: 'category', label: 'Category', default: true },
       { key: 'images', label: 'Images (first 3 URLs)', default: true },
       { key: 'metafields', label: 'Metafields', default: true },
+      { key: 'price', label: 'Price', default: true },
       { key: 'variants', label: 'Variants', default: false },
       { key: 'descriptionHtml', label: 'Description (HTML)', default: false },
       { key: 'seo', label: 'SEO Title & Description', default: false },
@@ -1611,7 +1654,6 @@ function getSidebarHtml_() {
     }).join('');
   }
   
-  // ── TOGGLE HELPERS ──
   function toggleSection(header) {
     header.classList.toggle('collapsed');
     header.nextElementSibling.classList.toggle('collapsed');
@@ -1623,13 +1665,11 @@ function getSidebarHtml_() {
     checkboxes.forEach(cb => cb.checked = !allChecked);
   }
   
-  // ── GET SELECTED VALUES ──
   function getSelected(namePrefix) {
     return Array.from(document.querySelectorAll('input[name="' + namePrefix + '"]:checked'))
       .map(cb => cb.value);
   }
   
-  // ── PREVIEW ──
   function loadPreview() {
     const area = document.getElementById('previewArea');
     area.innerHTML = '<div class="preview-box"><div class="loading"><div class="spinner"></div></div></div>';
@@ -1678,14 +1718,12 @@ function getSidebarHtml_() {
     return '<div class="field"><span class="field-label">' + label + ':</span> <span class="field-value">' + escapeHtml(value || '(empty)') + '</span></div>';
   }
   
-  // ── EXECUTE PULL ──
   function executePull() {
     const btn = document.getElementById('pullBtn');
     const status = document.getElementById('statusText');
     btn.disabled = true;
     status.textContent = '🔄 Pulling products...';
     
-    // Gather selections
     const options = {
       filters: {
         statuses: getSelected('statusFilter'),
@@ -1697,7 +1735,6 @@ function getSidebarHtml_() {
       metafieldKeys: getSelected('mfKey')
     };
     
-    // Fields
     const fieldCheckboxes = document.querySelectorAll('input[name="field"]:checked');
     fieldCheckboxes.forEach(cb => { options.fields[cb.value] = true; });
     
@@ -1713,7 +1750,6 @@ function getSidebarHtml_() {
       .executePull(options);
   }
   
-  // ── UTILS ──
   function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1723,10 +1759,11 @@ function getSidebarHtml_() {
 </body>
 </html>`;
 }
-// ── MAIN FUNCTION: BUILD TAXONOMY REFERENCE ─────────────────
-// This is the function that does all the work.
-// It runs when you click "Build Taxonomy Reference" in the menu.
- 
+
+// ════════════════════════════════════════════════════════════
+// TAXONOMY REFERENCE BUILDER (Phase 1)
+// ════════════════════════════════════════════════════════════
+
 function buildTaxonomyReference() {
   const ui = SpreadsheetApp.getUi();
   
@@ -1746,7 +1783,6 @@ function buildTaxonomyReference() {
     const config = getConfig_();
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     
-    // ── STEP 1: Find which categories your products use ─────
     Logger.log('Step 1: Scanning product categories...');
     const categoryMap = scanProductCategories_(token, config);
     
@@ -1755,19 +1791,15 @@ function buildTaxonomyReference() {
       return;
     }
     
-    // ── STEP 2: For each category, get its taxonomy attributes ─
     Logger.log('Step 2: Fetching taxonomy attributes for each category...');
     const taxonomyData = fetchTaxonomyAttributes_(token, config, categoryMap);
     
-    // ── STEP 3: Fetch metaobject definitions & entries ───────
     Logger.log('Step 3: Fetching metaobject entries from your store...');
     const metaobjectData = fetchStoreMetaobjects_(token, config, taxonomyData);
     
-    // ── STEP 4: Write to the Taxonomy Reference sheet ────────
     Logger.log('Step 4: Writing to sheet...');
     writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectData);
     
-    // ── DONE ─────────────────────────────────────────────────
     const catCount = Object.keys(categoryMap).length;
     const attrCount = Object.values(taxonomyData).reduce((sum, attrs) => sum + attrs.length, 0);
     
@@ -1779,10 +1811,7 @@ function buildTaxonomyReference() {
       `Found:\n` +
       `• ${catCount} product categories in use\n` +
       `• ${attrCount} total attributes across those categories\n\n` +
-      `Check the "Taxonomy Reference" sheet.\n` +
-      `It has two sections:\n` +
-      `  📋 Top: Category → Attribute mapping\n` +
-      `  📋 Below: Attribute → Allowed Values with GIDs`,
+      `Check the "Taxonomy Reference" sheet.`,
       ui.ButtonSet.OK
     );
     
@@ -1791,14 +1820,9 @@ function buildTaxonomyReference() {
     Logger.log('Taxonomy reference error: ' + e.stack);
   }
 }
- 
- 
-// ── STEP 1 HELPER: Scan products to find categories in use ──
-// Goes through all products and collects unique category IDs
-// along with their names and how many products use each.
- 
+
 function scanProductCategories_(token, config) {
-  const categoryMap = {};  // categoryId -> { name, fullName, productCount }
+  const categoryMap = {};
   let cursor = null;
   let hasNextPage = true;
   
@@ -1852,13 +1876,6 @@ function scanProductCategories_(token, config) {
   Logger.log(`Found ${Object.keys(categoryMap).length} unique categories`);
   return categoryMap;
 }
- 
-// ── FIXED STEP 2 HELPER (v4 — FINAL) ───────────────────────
-// REPLACE your existing fetchTaxonomyAttributes_ function with this one.
-//
-// The issue: TaxonomyAttribute (generic) doesn't have a 'name' field,
-// only TaxonomyChoiceListAttribute and TaxonomyMeasurementAttribute do.
-// Removed the generic fragment — we only need choice list attributes anyway.
 
 function fetchTaxonomyAttributes_(token, config, categoryMap) {
   var taxonomyData = {};
@@ -1926,22 +1943,10 @@ function fetchTaxonomyAttributes_(token, config, categoryMap) {
 
   return taxonomyData;
 }
- 
- 
-// ── STEP 3 HELPER: Fetch metaobject entries from your store ──
-// Category metafields are stored as metaobject references.
-// Each attribute (like "Fabric") has a corresponding metaobject type
-// (like "shopify--fabric") in your store.
-//
-// This function:
-// 1. Lists all metaobject definitions that start with "shopify--"
-// 2. For each one, fetches all entries (the actual selectable values)
-// 3. Maps each entry to its display name and GID
- 
+
 function fetchStoreMetaobjects_(token, config, taxonomyData) {
-  const metaobjectData = {};  // type -> [{ gid, displayName, handle, fields }]
+  const metaobjectData = {};
   
-  // First, get all standard (shopify--*) metaobject definitions
   const defQuery = `{
     metaobjectDefinitions(first: 100) {
       edges {
@@ -1961,13 +1966,10 @@ function fetchStoreMetaobjects_(token, config, taxonomyData) {
   
   const defResult = shopifyGraphQL_(token, config.shopDomain, defQuery);
   const allDefs = defResult.data.metaobjectDefinitions.edges.map(e => e.node);
-  
-  // Filter to only shopify-- standard definitions (category metafield types)
   const standardDefs = allDefs.filter(d => d.type.startsWith('shopify--'));
   
   Logger.log(`Found ${standardDefs.length} standard metaobject definitions: ${standardDefs.map(d => d.type).join(', ')}`);
   
-  // For each standard definition, fetch its entries
   for (const def of standardDefs) {
     Logger.log(`  Fetching entries for: ${def.type} (${def.name})`);
     
@@ -2037,22 +2039,7 @@ function fetchStoreMetaobjects_(token, config, taxonomyData) {
   
   return metaobjectData;
 }
- 
- 
-// ── STEP 4 HELPER: Write the Taxonomy Reference sheet ────────
-// Creates (or overwrites) a sheet called "Taxonomy Reference" with:
-//
-// SECTION 1 — "Categories & Their Attributes"
-//   Shows which attributes are available for each category.
-//   Columns: Category ID | Category Name | Full Path | Products | Attribute | Attribute ID
-//
-// SECTION 2 — "Attribute Values (Your Store's Metaobject Entries)"
-//   Shows the allowed values for each attribute, with your store's GIDs.
-//   Columns: Metaobject Type | Attribute Name | Display Name | Metaobject GID | Handle
-//
-// This sheet is the "Rosetta Stone" — when you later pull category metafields,
-// the script uses this sheet to convert GIDs to readable names and back.
- 
+
 function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectData) {
   let sheet = ss.getSheetByName('Taxonomy Reference');
   if (!sheet) {
@@ -2062,7 +2049,6 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
   
   let currentRow = 1;
   
-  // ── SECTION 1 HEADER ──
   sheet.getRange(currentRow, 1).setValue('📋 SECTION 1: Categories & Their Attributes')
     .setFontWeight('bold').setFontSize(12);
   currentRow += 1;
@@ -2081,10 +2067,6 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
     .setBackground('#d9e2f3');
   currentRow += 1;
   
-  // ── SECTION 1 DATA ──
-  const sec1StartRow = currentRow;
-  
-  // Sort categories by product count (most products first)
   const sortedCatIds = Object.keys(categoryMap).sort((a, b) => 
     categoryMap[b].productCount - categoryMap[a].productCount
   );
@@ -2094,7 +2076,6 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
     const attrs = taxonomyData[catId] || [];
     
     if (attrs.length === 0) {
-      // Category has no attributes — still show it
       sheet.getRange(currentRow, 1, 1, sec1Headers.length).setValues([[
         catId, cat.name, cat.fullName, cat.productCount,
         '(no attributes)', '', '', ''
@@ -2112,10 +2093,8 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
     }
   }
   
-  // Add a gap before section 2
   currentRow += 2;
   
-  // ── SECTION 2 HEADER ──
   sheet.getRange(currentRow, 1).setValue('📋 SECTION 2: Attribute Values (Metaobject Entries in Your Store)')
     .setFontWeight('bold').setFontSize(12);
   currentRow += 1;
@@ -2134,8 +2113,6 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
     .setBackground('#e2f0d9');
   currentRow += 1;
   
-  // ── SECTION 2 DATA ──
-  // Sort metaobject types alphabetically
   const sortedTypes = Object.keys(metaobjectData).sort();
   
   for (const moType of sortedTypes) {
@@ -2147,7 +2124,6 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
       ]]);
       currentRow += 1;
     } else {
-      // Sort entries by display name
       const sortedEntries = mo.entries.sort((a, b) => 
         (a.displayName || '').localeCompare(b.displayName || '')
       );
@@ -2161,37 +2137,21 @@ function writeTaxonomyReferenceSheet_(ss, categoryMap, taxonomyData, metaobjectD
     }
   }
   
-  // ── FORMATTING ──
-  // Auto-resize the important columns
   for (let i = 1; i <= Math.max(sec1Headers.length, sec2Headers.length); i++) {
     try { sheet.autoResizeColumn(i); } catch (e) { /* ignore */ }
   }
   
-  // Freeze the first row area isn't useful here since we have two sections,
-  // but we can at least add a timestamp
   currentRow += 2;
   sheet.getRange(currentRow, 1).setValue('Last refreshed:').setFontWeight('bold');
   sheet.getRange(currentRow, 2).setValue(new Date());
   
-  // Set sheet tab color to distinguish it
   sheet.setTabColor('#9fc5e8');
 }
-// SECTION A: NEW HELPER FUNCTIONS — paste at bottom of script
-// ============================================================
- 
- 
-// ── LOAD TAXONOMY REFERENCE INTO MEMORY ─────────────────────
-// Reads the "Taxonomy Reference" sheet and builds lookup maps.
-// Returns null if the sheet doesn't exist (just means you haven't
-// run Build Taxonomy Reference yet).
-//
-// Returns: {
-//   gidToDisplayName: { "gid://shopify/Metaobject/123": "V-neck", ... },
-//   displayNameToGid: { "shopify--neckline": { "V-neck": "gid://...", ... }, ... },
-//   metaobjectTypeToAttributeName: { "shopify--neckline": "Neckline", ... },
-//   categoryAttributes: { "gid://shopify/TaxonomyCategory/aa-1-4": ["Color", "Neckline", ...], ... }
-// }
- 
+
+// ════════════════════════════════════════════════════════════
+// TAXONOMY HELPER FUNCTIONS (Phase 2-4)
+// ════════════════════════════════════════════════════════════
+
 function loadTaxonomyReference_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName('Taxonomy Reference');
@@ -2201,7 +2161,7 @@ function loadTaxonomyReference_() {
   var data = sheet.getDataRange().getValues();
   
   var gidToDisplayName = {};
-  var displayNameToGid = {};  // grouped by metaobject type
+  var displayNameToGid = {};
   var metaobjectTypeToAttributeName = {};
   var categoryAttributes = {};
   
@@ -2211,7 +2171,6 @@ function loadTaxonomyReference_() {
   for (var i = 0; i < data.length; i++) {
     var row = data[i];
     
-    // Detect section boundaries
     if (row[0] && row[0].toString().indexOf('SECTION 1') !== -1) {
       inSection1 = true;
       inSection2 = false;
@@ -2223,14 +2182,11 @@ function loadTaxonomyReference_() {
       continue;
     }
     
-    // Skip header rows
     if (row[0] === 'Category ID' || row[0] === 'Metaobject Type') continue;
-    // Skip description rows
     if (row[0] && row[0].toString().indexOf('Shows which') !== -1) continue;
     if (row[0] && row[0].toString().indexOf('These are the') !== -1) continue;
     
     if (inSection1) {
-      // Section 1: Category ID | Category Name | Full Path | Products | Attribute Name | Attribute ID | Type | Value Count
       var catId = row[0] ? row[0].toString().trim() : '';
       var attrName = row[4] ? row[4].toString().trim() : '';
       
@@ -2241,7 +2197,6 @@ function loadTaxonomyReference_() {
     }
     
     if (inSection2) {
-      // Section 2: Metaobject Type | Attribute Name | Display Name | Metaobject GID | Handle
       var moType = row[0] ? row[0].toString().trim() : '';
       var attrDisplayName = row[1] ? row[1].toString().trim() : '';
       var valueName = row[2] ? row[2].toString().trim() : '';
@@ -2249,19 +2204,14 @@ function loadTaxonomyReference_() {
       var handle = row[4] ? row[4].toString().trim() : '';
       
       if (gid && valueName) {
-        // GID → Display Name (for pulling: converting GIDs to names)
         gidToDisplayName[gid] = valueName;
         
-        // Metaobject type → Attribute name mapping
         if (moType && attrDisplayName) {
           metaobjectTypeToAttributeName[moType] = attrDisplayName;
         }
         
-        // Display Name → GID grouped by type (for pushing: converting names back to GIDs)
-        // Only store the FIRST occurrence (original, not duplicates like casual-1)
         if (moType) {
           if (!displayNameToGid[moType]) displayNameToGid[moType] = {};
-          // Only store if we don't have this display name yet (skip duplicates)
           if (!displayNameToGid[moType][valueName]) {
             displayNameToGid[moType][valueName] = gid;
           }
@@ -2277,28 +2227,16 @@ function loadTaxonomyReference_() {
     categoryAttributes: categoryAttributes
   };
 }
- 
- 
-// ── CHECK IF A METAFIELD IS A CATEGORY METAFIELD ────────────
-// Category metafields live under the "shopify" namespace.
-// e.g. "shopify.fabric", "shopify.neckline", "shopify.color-pattern"
- 
+
 function isCategoryMetafield_(namespaceKey) {
   return namespaceKey.indexOf('shopify.') === 0;
 }
- 
- 
-// ── RESOLVE A METAFIELD VALUE (JSON GID ARRAY) TO NAMES ─────
-// Category metafields store values as JSON arrays of Metaobject GIDs:
-//   ["gid://shopify/Metaobject/123", "gid://shopify/Metaobject/456"]
-// This function converts that to "V-neck, Round" using the reference.
- 
+
 function resolveMetaobjectGids_(rawValue, gidToDisplayName) {
   if (!rawValue) return '';
   
   var value = rawValue.toString().trim();
   
-  // Try to parse as JSON array
   try {
     var gids = JSON.parse(value);
     if (Array.isArray(gids)) {
@@ -2309,48 +2247,34 @@ function resolveMetaobjectGids_(rawValue, gidToDisplayName) {
         if (name) {
           names.push(name);
         } else {
-          // GID not found in reference — keep the raw GID so we don't lose data
           names.push(gid);
         }
       }
       return names.join(', ');
     }
   } catch (e) {
-    // Not valid JSON — might be a single GID or already a display name
+    // Not valid JSON
   }
   
-  // Check if it's a single GID (not wrapped in array)
   if (value.indexOf('gid://shopify/Metaobject/') === 0) {
     return gidToDisplayName[value] || value;
   }
   
-  // Already a display name or something else — return as-is
   return value;
 }
- 
- 
-// ── MAP SHOPIFY NAMESPACE.KEY TO A FRIENDLY COLUMN NAME ─────
-// Converts "shopify.neckline" → "CAT: Neckline"
-// Converts "shopify.color-pattern" → "CAT: Color"
-// Uses the Taxonomy Reference to find the proper attribute name.
-// Falls back to title-casing the key if reference isn't available.
- 
+
 function categoryMetafieldColumnName_(namespaceKey, taxRef) {
   var key = namespaceKey.replace('shopify.', '');
   var moType = 'shopify--' + key;
   
-  // Try to find the friendly name from the reference
   if (taxRef && taxRef.metaobjectTypeToAttributeName[moType]) {
     return 'CAT: ' + taxRef.metaobjectTypeToAttributeName[moType];
   }
   
-  // Fallback: title-case the key
   var friendly = key.replace(/-/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
   return 'CAT: ' + friendly;
 }
- 
- 
-// ============================================================
+
 function catColumnToMetafieldKey_(columnName, taxRef) {
   if (!columnName || columnName.indexOf('CAT: ') !== 0) return null;
   
@@ -2358,13 +2282,10 @@ function catColumnToMetafieldKey_(columnName, taxRef) {
   
   if (!taxRef) return null;
   
-  // Search metaobjectTypeToAttributeName for a match
   var types = Object.keys(taxRef.metaobjectTypeToAttributeName);
   for (var i = 0; i < types.length; i++) {
     if (taxRef.metaobjectTypeToAttributeName[types[i]] === attrName) {
-      // Found it. Type is like "shopify--neckline"
-      // Convert to namespace.key: "shopify.neckline"
-      var moType = types[i]; // "shopify--neckline"
+      var moType = types[i];
       var parts = moType.split('--');
       if (parts.length === 2) {
         return { namespace: parts[0], key: parts[1], moType: moType };
@@ -2372,19 +2293,10 @@ function catColumnToMetafieldKey_(columnName, taxRef) {
     }
   }
   
-  // Fallback: guess from the column name
-  // "CAT: Neckline" → "shopify.neckline"
   var guessedKey = attrName.toLowerCase().replace(/ /g, '-');
   return { namespace: 'shopify', key: guessedKey, moType: 'shopify--' + guessedKey };
 }
- 
- 
-// ── CONVERT DISPLAY NAMES TO GID JSON ARRAY ─────────────────
-// Takes "V-neck, Round" and converts to:
-//   ["gid://shopify/Metaobject/123", "gid://shopify/Metaobject/456"]
-// Uses the Taxonomy Reference for the lookup.
-// Returns the JSON string that Shopify expects.
- 
+
 function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
   if (!displayNamesCsv || !displayNamesCsv.toString().trim()) return '[]';
   if (!taxRef) return '[]';
@@ -2402,7 +2314,6 @@ function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
     if (gid) {
       gids.push(gid);
     } else {
-      // Try case-insensitive match
       var found = false;
       var keys = Object.keys(lookupTable);
       for (var j = 0; j < keys.length; j++) {
@@ -2413,7 +2324,6 @@ function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
         }
       }
       if (!found) {
-        // Check if it's already a GID (user pasted raw GID)
         if (name.indexOf('gid://shopify/Metaobject/') === 0) {
           gids.push(name);
         } else {
@@ -2430,50 +2340,10 @@ function displayNamesToGidJson_(displayNamesCsv, moType, taxRef) {
   
   return JSON.stringify(gids);
 }
- 
- 
-// ============================================================
-// ============================================================
-// PHASE 4 — DROPDOWN VALIDATION FOR CATEGORY METAFIELDS
-// ============================================================
-//
-// WHAT THIS DOES:
-// Adds dropdown lists to CAT: columns in the Push tab.
-// So when you click a cell under "CAT: Neckline", you get a
-// dropdown with "Asymmetric, Halter, Round, Square, V-neck"
-// instead of having to type it manually.
-//
-// HOW TO INSTALL:
-// 1. Add the new menu item to your onOpen() function (see below)
-// 2. Paste the functions (Section A) at the bottom of your script
-//
-// HOW TO USE:
-// 1. Pull products (so Data tab exists)
-// 2. Copy rows to Push tab
-// 3. Click 🛍️ Shopify → 🔽 Add Dropdowns to Push Tab
-//    (or it runs automatically from the Push Panel)
-// ============================================================
 
-
-// ── UPDATE YOUR onOpen() ────────────────────────────────────
-// Add this line to your menu, after the Build Taxonomy Reference item:
-//
-//   .addItem('🔽 Add Dropdowns to Push Tab', 'addPushDropdowns')
-//
-// So it looks like:
-//   .addItem('🏷️ Build Taxonomy Reference', 'buildTaxonomyReference')
-//   .addItem('🔽 Add Dropdowns to Push Tab', 'addPushDropdowns')
-//   .addToUi();
-
-
-// ============================================================
-// SECTION A: NEW FUNCTIONS — paste at bottom of script
-// ============================================================
-
-
-// ── MAIN FUNCTION: ADD DROPDOWNS TO PUSH TAB ────────────────
-// Scans the Push tab for CAT: columns, looks up allowed values
-// from the Taxonomy Reference sheet, and applies data validation.
+// ════════════════════════════════════════════════════════════
+// DROPDOWN VALIDATION (Phase 4)
+// ════════════════════════════════════════════════════════════
 
 function addPushDropdowns() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -2505,23 +2375,20 @@ function addPushDropdowns() {
     
     if (header.indexOf('CAT: ') !== 0) continue;
     
-    // Find the metaobject type for this column
     var catInfo = catColumnToMetafieldKey_(header, taxRef);
     if (!catInfo) continue;
     
-    // Get allowed values from the reference
     var lookupTable = taxRef.displayNameToGid[catInfo.moType];
     if (!lookupTable) continue;
     
     var allowedValues = Object.keys(lookupTable).sort();
     if (allowedValues.length === 0) continue;
     
-    // Apply data validation to all data rows in this column
     var range = pushSheet.getRange(2, col + 1, lastRow - 1, 1);
     
     var rule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(allowedValues, true)  // true = show dropdown
-      .setAllowInvalid(false)  // reject values not in the list
+      .requireValueInList(allowedValues, true)
+      .setAllowInvalid(false)
       .setHelpText('Pick from: ' + allowedValues.join(', '))
       .build();
     
